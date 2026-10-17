@@ -133,6 +133,15 @@ __pypackages__/
 celerybeat-schedule*
 celerybeat.pid
 
+# macOS
+.DS_Store
+
+# Project-specific
+temporal_graph_rag_architecture.md
+AGENTS.md
+ARCHITECTURE_SPEC.md
+config_reference.py
+
 # Redis
 *.rdb
 *.aof
@@ -218,3 +227,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw data (MIMIC requires credentialed access, PrimeKG is large)
+data/raw/
+data/interim/
+
+# Model checkpoints & adapters
+checkpoints/
+
+# Weights & Biases
+wandb/
