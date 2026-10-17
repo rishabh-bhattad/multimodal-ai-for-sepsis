@@ -10,6 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 DATA_RAW = PROJECT_ROOT / "data" / "raw"
 MIMIC_IV_DIR = DATA_RAW / "mimic_iv"
+MIMIC_IV_HOSP_DIR = MIMIC_IV_DIR / "hosp"
+MIMIC_IV_ICU_DIR = MIMIC_IV_DIR / "icu"
 MIMIC_CXR_DIR = DATA_RAW / "mimic_cxr"
 PRIMEKG_DIR = DATA_RAW / "primekg"
 PRIMEKG_CSV = PRIMEKG_DIR / "kg.csv"
