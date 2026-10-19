@@ -50,3 +50,45 @@ LAB_ITEM_IDS = {
     "bilirubin": [50885],
     "wbc": [51300, 51301],
 }
+
+# Step 2: Feature extraction & entity linking
+PATIENT_WINDOWS_PARQUET = DATA_INTERIM / "patient_windows.parquet"
+TEMPORAL_QUADRUPLES_JSON = DATA_INTERIM / "temporal_quadruples.json"
+PRIMEKG_CLINICAL_EMBEDDINGS = DATA_INTERIM / "primekg_clinical_embeddings.pt"
+
+TARGET_PATHOLOGIES = [
+    "Consolidation",
+    "Pleural Effusion",
+    "Atelectasis",
+    "Pneumonia",
+    "Lung Opacity",
+    "Edema",
+    "Cardiomegaly",
+]
+
+LAB_SEVERITY_THRESHOLDS = {
+    "lactate": [
+        (4.0, ">", "Lactic Acidosis"),
+        (2.0, ">", "Hyperlactatemia"),
+    ],
+    "map": [
+        (65.0, "<", "Systemic Hypotension"),
+    ],
+    "platelets": [
+        (100.0, "<", "Thrombocytopenia"),
+    ],
+    "creatinine": [
+        (1.2, ">", "Acute Kidney Injury"),
+    ],
+    "wbc": [
+        (12.0, ">", "Leukocytosis"),
+        (4.0, "<", "Leukopenia"),
+    ],
+    "temp": [
+        (38.3, ">", "Pyrexia"),
+        (36.0, "<", "Hypothermia"),
+    ],
+}
+
+SAPBERT_MODEL_NAME = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+SAPBERT_SIMILARITY_THRESHOLD = 0.70
