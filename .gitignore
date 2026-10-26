@@ -141,6 +141,9 @@ temporal_graph_rag_architecture.md
 AGENTS.md
 ARCHITECTURE_SPEC.md
 config_reference.py
+/IMPLEMENTATION_PLAN.md
+/TASKS.md
+/CONCEPTUAL_GUIDE.md
 
 # Redis
 *.rdb
