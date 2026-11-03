@@ -2,6 +2,8 @@
 
 A multimodal research project combining ICU electronic health records, chest radiographs, and biomedical knowledge graphs to estimate sepsis probability from 24 hours of observations.
 
+The planned VLM output contains `sepsis_probability` and `reasoning_chain`, a short evidence-based clinical rationale. There is no separate phenotype prediction. The rationale may mention a possible infection source when supported, with uncertainty stated. Binary Sepsis-3 labels supervise prediction; the generated rationale is evaluated for evidence support without assuming ground-truth explanation labels.
+
 ---
 
 ## Overview
@@ -11,7 +13,7 @@ Clinical trajectories in the ICU are dynamic. This project investigates whether 
 ### Datasets
 
 * **MIMIC-IV (v2.2+)**: ICU vitals, laboratory tests, microbiology cultures, and antibiotic prescriptions (requires credentialed access via PhysioNet).
-* **MIMIC-CXR-JPG (v2.0.0)**: Frontal chest radiographs and associated study metadata (requires credentialed access via PhysioNet).
+* **MIMIC-CXR-JPG (v2.1.0)**: Frontal chest radiographs and associated study metadata, both sourced from the v2.1.0 release (requires credentialed access via PhysioNet).
 * **PrimeKG**: Precision medicine knowledge graph linking diseases, phenotypes, and biological pathways (Harvard Dataverse).
 
 ---

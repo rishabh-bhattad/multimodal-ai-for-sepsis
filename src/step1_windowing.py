@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import duckdb
@@ -260,6 +261,7 @@ def validate_windows(con, cohort, windows, sample_size):
         "stays_per_cohort_type": cohort.cohort_type.value_counts().to_dict(),
         "patients_per_split": cohort.groupby("split").subject_id.nunique().to_dict(),
         "windows_with_cxr": int(windows.cxr_path.notna().sum()),
+        "unique_cxr_images": int(windows.cxr_path.nunique()),
         "observed_temperatures": int(windows.temp_mean.notna().sum()),
         "temperatures_outside_25_to_45_celsius": int(((windows.temp_mean < 25) | (windows.temp_mean > 45)).sum()),
         "missing_fraction": windows[[c for c in windows if c.endswith(("_mean", "_latest", "_slope"))]].isna().mean().round(4).to_dict(),
@@ -290,8 +292,12 @@ def main():
         parser.error("--candidate_size must be at least --sample_size and only used for smoke runs")
     if config.NUM_WINDOWS * config.WINDOW_SIZE_HOURS != config.OBSERVATION_HOURS:
         parser.error("Window settings must partition the observation period exactly")
-    settings = {"threads": config.DUCKDB_THREADS, "memory_limit": config.DUCKDB_MEMORY_LIMIT, "temp_directory": ""}
-    with duckdb.connect(config=settings) as con:
+    config.DUCKDB_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    settings = {"threads": config.DUCKDB_THREADS, "memory_limit": config.DUCKDB_MEMORY_LIMIT,
+                "max_temp_directory_size": config.DUCKDB_MAX_TEMP_DIRECTORY_SIZE}
+    with tempfile.TemporaryDirectory(dir=config.DUCKDB_TEMP_DIR, prefix="step1-") as spill_dir, duckdb.connect(
+        config={**settings, "temp_directory": spill_dir}
+    ) as con:
         try:
             load_candidates(con, sample_size, args.candidate_size)
             derive_reference(con)
@@ -301,9 +307,10 @@ def main():
             summary = validate_windows(con, cohort, windows, sample_size)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             windows.to_parquet(args.output, index=False)
-            cohort.drop(columns="has_cxr").to_parquet(config.COHORT_PARQUET, index=False)
-            config.STEP1_VALIDATION_JSON.write_text(json.dumps(summary, indent=2) + "\n")
+            cohort.drop(columns="has_cxr").to_parquet(args.output.parent / config.COHORT_PARQUET.name, index=False)
+            (args.output.parent / config.STEP1_VALIDATION_JSON.name).write_text(json.dumps(summary, indent=2) + "\n")
             logger.info("Validation passed: %d patients, %d stays, %d windows, %d image windows", summary["unique_patients"], summary["stays"], summary["windows"], summary["windows_with_cxr"])
+            logger.info("Unique cohort images: %d", summary["unique_cxr_images"])
             logger.info("Cohort counts: %s; split counts: %s", summary["stays_per_label"], summary["patients_per_split"])
         except RuntimeError as exc:
             logger.error("%s", exc)
