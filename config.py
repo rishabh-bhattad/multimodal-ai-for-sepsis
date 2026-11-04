@@ -79,13 +79,13 @@ LAB_SEVERITY_THRESHOLDS = {
         (2.0, ">", "Hyperlactatemia"),
     ],
     "map": [
-        (65.0, "<", "Systemic Hypotension"),
+        (70.0, "<", "Systemic Hypotension"),
     ],
     "platelets": [
-        (100.0, "<", "Thrombocytopenia"),
+        (150.0, "<", "Thrombocytopenia"),
     ],
     "creatinine": [
-        (1.2, ">", "Acute Kidney Injury"),
+        (1.2, ">=", "Elevated Creatinine"),
     ],
     "wbc": [
         (12.0, ">", "Leukocytosis"),

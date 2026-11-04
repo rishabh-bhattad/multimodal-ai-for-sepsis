@@ -180,7 +180,8 @@ def test_window_boundaries_temperature_slopes_and_images(con):
     seed_stay(con)
     infection(con, culture_hour=48, antibiotic_hour=49)
     chart(con, 223761, 98.6, 25)
-    chart(con, 223762, 37, 26)
+    chart(con, 223762, 38, 26)
+    lab(con, 50813, 4.5, hour=28, specimen=5)
     lab(con, 50813, 2, hour=29, specimen=2)
     lab(con, 50813, 4, hour=30, specimen=3)
     lab(con, 50813, 99, hour=48, specimen=4)
@@ -190,7 +191,9 @@ def test_window_boundaries_temperature_slopes_and_images(con):
     cohort = step1.select_cohort(con, 1)
     windows = step1.aggregate_windows(con)
     assert len(windows) == 4
-    assert windows.temp_mean.iloc[0] == pytest.approx(37)
+    assert windows.temp_mean.iloc[0] == pytest.approx(37.5)
+    assert windows.temp_latest.iloc[0] == 38
+    assert windows.map_latest.iloc[0] == 82
     assert windows.lactate_latest.iloc[:2].tolist() == [2, 4]
     assert windows.cxr_dicom_id.dropna().tolist() == ['first', 'boundary']
     assert windows.hr_slope.tolist() == [0, 0, 0, 0]
@@ -255,6 +258,9 @@ def test_unobserved_windows_and_single_measurement_slope_remain_missing(con):
     windows = step1.aggregate_windows(con)
     assert windows.hr_mean.iloc[0] == 80
     assert windows.hr_mean.iloc[1:].isna().all()
+    assert windows.map_latest.iloc[0] == 82
+    assert windows.map_latest.iloc[1:].isna().all()
+    assert windows.temp_latest.isna().all()
     assert windows.hr_slope.isna().all()
     assert windows.lactate_latest.isna().all()
 

@@ -184,7 +184,7 @@ def select_cohort(con, sample_size):
 
 
 def aggregate_windows(con):
-    """Aggregate the same four six-hour windows with explicit missing values."""
+    """Aggregate four six-hour windows, retaining latest measurements and explicit missingness."""
     con.execute("""
         CREATE TEMP TABLE windows AS
         SELECT c.*, idx AS window_idx,
@@ -199,6 +199,10 @@ def aggregate_windows(con):
             NULLIF(epoch(MAX(charttime) FILTER (WHERE {col} IS NOT NULL)
                        - MIN(charttime) FILTER (WHERE {col} IS NOT NULL)) / 3600.0, 0)
             AS {prefix}_slope""")
+    expressions.extend([
+        "arg_max(mbp, charttime) AS map_latest",
+        "arg_max(temperature, charttime) AS temp_latest",
+    ])
     labs = [f"arg_max(valuenum, charttime) FILTER (WHERE itemid IN ({','.join(map(str,ids))}) AND valuenum > 0) AS {name}_latest" for name, ids in config.LAB_ITEM_IDS.items()]
     return con.execute(f"""
         WITH vitals AS (
