@@ -75,7 +75,7 @@ TARGET_PATHOLOGIES = [
 
 LAB_SEVERITY_THRESHOLDS = {
     "lactate": [
-        (4.0, ">", "Lactic Acidosis"),
+        (4.0, ">", "Elevated Lactate above 4 mmol/L"),
         (2.0, ">", "Hyperlactatemia"),
     ],
     "map": [
@@ -99,6 +99,16 @@ LAB_SEVERITY_THRESHOLDS = {
 
 SAPBERT_MODEL_NAME = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
 SAPBERT_SIMILARITY_THRESHOLD = 0.70
+SAPBERT_MODEL_REVISION = "090663c3ae57bf35ffe4d0d468a2a88d03051a4d"
+SAPBERT_BATCH_SIZE = 128
+SAPBERT_MAX_LENGTH = 32
+SAPBERT_THREADS = 2
+SAPBERT_MAPPINGS_JSON = DATA_INTERIM / "sapbert_finding_mappings.json"
+# Chest-radiograph edema has pulmonary context; retain the original source label in output.
+CXR_MAPPING_QUERIES = {"Edema": "Pulmonary edema"}
+SAPBERT_UNMATCHED_CHECKS = ["No finding documented", "qzxv nonexistent observation"]
+STEP2_SAMPLE_SIZE = 10
+STEP2_CSV_CHUNK_SIZE = 50000
 
 # Vision-Language Model backbone (Step 5)
 BASE_LVLM_NAME = "Qwen/Qwen3-VL-8B-Instruct"

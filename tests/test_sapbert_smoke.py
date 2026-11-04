@@ -1,49 +1,51 @@
-"""Smoke test for SapBERT clinical entity embeddings and similarity matching."""
+"""Synthetic mapping checks; actual PrimeKG score evidence comes from the local smoke run."""
 
+import sys
+from pathlib import Path
+
+import pytest
 import torch
-import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import config
+from src.step2_extraction import rank_matches, resolve_mappings
 
 
-def main():
-    model_name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
-    print(f"Loading {model_name}...")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    model.eval()
-
-    queries = ["Lactic Acidosis", "Systemic Hypotension", "Pyrexia", "Thrombocytopenia"]
-    synonyms = ["Hyperlactatemia", "Low Blood Pressure", "Fever", "Low Platelet Count"]
-    unrelated = ["Atelectasis", "Normal Saline", "Bone Fracture", "Ear Infection"]
-
-    def embed(texts):
-        inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs)
-            # Use CLS token representation as per SapBERT specification
-            cls_rep = outputs.last_hidden_state[:, 0, :]
-            return F.normalize(cls_rep, p=2, dim=1)
-
-    query_emb = embed(queries)
-    syn_emb = embed(synonyms)
-    unrelated_emb = embed(unrelated)
-
-    syn_sims = torch.sum(query_emb * syn_emb, dim=1)
-    unrelated_sims = torch.sum(query_emb * unrelated_emb, dim=1)
-
-    print("\n--- Synonymous Pairs (Expected: High Similarity > 0.70) ---")
-    for q, s, sim in zip(queries, synonyms, syn_sims):
-        print(f"  {q:<22} <-> {s:<22} : {sim.item():.4f}")
-
-    print("\n--- Unrelated Pairs (Expected: Low Similarity < 0.50) ---")
-    for q, u, sim in zip(queries, unrelated, unrelated_sims):
-        print(f"  {q:<22} <-> {u:<22} : {sim.item():.4f}")
-
-    assert (syn_sims > 0.65).all(), "Some synonymous pairs scored below 0.65"
-    assert (unrelated_sims < 0.50).all(), "Some unrelated pairs scored above 0.50"
-    print("\n[SUCCESS] SapBERT entity linking smoke test passed.")
+def test_cosine_ranking_preserves_node_identity():
+    nodes = [{'node_type': 'effect/phenotype', 'node_id': str(i), 'node_name': f'Finding {i}'} for i in range(3)]
+    candidates = rank_matches(['Observation'], torch.tensor([[1., 0.]]), nodes,
+                              torch.tensor([[0., 1.], [1., 0.], [-1., 0.]]))
+    assert candidates['Observation'][0]['node']['node_id'] == '1'
+    assert [match['similarity'] for match in candidates['Observation']] == [1., 0., -1.]
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize('score,status', [(0.699, 'unresolved'), (0.70, 'matched'), (0.71, 'matched')])
+def test_provisional_cutoff_is_applied_consistently(monkeypatch, score, status):
+    monkeypatch.setattr(config, 'SAPBERT_SIMILARITY_THRESHOLD', 0.70)
+    candidates = {'Observation': [{'node': {'node_id': '1'}, 'similarity': score}]}
+    match = resolve_mappings(['Observation'], candidates)['Observation']
+    assert match['mapping_status'] == status
+    assert (match['node'] is not None) == (status == 'matched')
+
+
+def test_direct_mapping_does_not_substitute_another_query():
+    candidates = {
+        'Pyrexia': [{'node': {'node_id': '1'}, 'similarity': 0.60}],
+        'Fever': [{'node': {'node_id': '2'}, 'similarity': 0.85}],
+    }
+    result = resolve_mappings(['Pyrexia'], candidates)
+    assert result['Pyrexia']['node'] is None
+    assert result['Pyrexia']['mapping_status'] == 'unresolved'
+    assert result['Pyrexia']['matched_query'] == 'Pyrexia'
+    assert result['Pyrexia']['similarity'] == 0.60
+
+
+def test_cxr_edema_uses_pulmonary_query_but_preserves_original_label():
+    candidates = {
+        'Edema': [{'node': {'node_id': 'general', 'node_name': 'Edema'}, 'similarity': 1.0}],
+        'Pulmonary edema': [{'node': {'node_id': 'pulmonary', 'node_name': 'Pulmonary edema'}, 'similarity': 0.99}],
+    }
+    mappings = resolve_mappings(['Edema'], candidates)
+    assert set(mappings) == {'Edema'}
+    assert mappings['Edema']['matched_query'] == 'Pulmonary edema'
+    assert mappings['Edema']['node']['node_id'] == 'pulmonary'
