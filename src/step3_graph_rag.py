@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import sys
+from itertools import combinations
 from pathlib import Path
 
 import networkx as nx
@@ -91,3 +92,62 @@ def load_primekg_graph(path=None):
         "edges": graph.number_of_edges(),
     }
     return graph
+
+
+def build_path_connectivity(graph):
+    """Index eligible associations in either direction without changing source edges.
+
+    The projection is only a connectivity index, not a patient subgraph or an
+    assertion that biomedical relationships have reversible meanings. Build it
+    once per loaded, unchanged PrimeKG graph and reuse it across windows.
+    """
+    connectivity = nx.Graph()
+    connectivity.add_nodes_from(graph)
+    connectivity.add_edges_from(
+        (source, target)
+        for source, target, data in graph.edges(data=True)
+        if data.get("eligible_for_connecting_paths", False)
+    )
+    return connectivity
+
+
+def retrieve_connecting_path_edges(graph, active_nodes, *, connectivity=None,
+                                   max_path_length=None):
+    """Return sorted native edges on every shortest path of at most two hops.
+
+    For each distinct pair of present seeds, a direct connection takes priority.
+    Otherwise each common neighbor supplies a shortest two-edge path. This
+    bounds search structurally without enumerating longer paths or calling
+    ``all_shortest_paths`` with an unsupported cutoff. Missing, isolated, and
+    singleton seeds yield no invented edges; trajectory assembly retains those
+    seeds separately. Negative associations never enter the path edge set.
+
+    ``connectivity`` may reuse ``build_path_connectivity(graph)`` provided the
+    source graph has not changed. Returned (source, target, relation) triples
+    preserve every eligible parallel relation and original edge direction.
+    Window edge budgeting is applied after path selection.
+    """
+    limit = config.STEP3_MAX_PATH_LENGTH if max_path_length is None else max_path_length
+    if type(limit) is not int or limit not in (1, 2):
+        raise ValueError("Connecting paths must be limited to one or two edges")
+    if connectivity is None:
+        connectivity = build_path_connectivity(graph)
+    seeds = sorted(set(active_nodes).intersection(graph))
+    selected = set()
+
+    def retain_native_edges(first, second):
+        for source, target in ((first, second), (second, first)):
+            for relation, data in graph.get_edge_data(source, target, default={}).items():
+                if data.get("eligible_for_connecting_paths", False):
+                    selected.add((source, target, relation))
+
+    for source, target in combinations(seeds, 2):
+        if connectivity.has_edge(source, target):
+            retain_native_edges(source, target)
+        elif limit == 2:
+            # Every shared neighbor is a shortest path; never expand past it.
+            common = set(connectivity.neighbors(source)).intersection(connectivity.neighbors(target))
+            for middle in sorted(common):
+                retain_native_edges(source, middle)
+                retain_native_edges(middle, target)
+    return tuple(sorted(selected))
