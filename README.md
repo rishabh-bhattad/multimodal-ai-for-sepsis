@@ -34,6 +34,7 @@ multimodal-ai-for-sepsis/
 ├── src/
 │   ├── step1_windowing.py    # MIT-LCP cohort derivation and four six-hour windows
 │   ├── step2_extraction.py   # Latest findings, CXR labels, and local SapBERT linking
+│   ├── step3_graph_rag.py    # Clinical PrimeKG ingestion; retrieval in progress
 │   ├── sql/                 # Cohort queries and MIT-LCP clinical derivations
 │   └── utils.py             # Shared logging and image-download helpers
 └── tests/                   # Pipeline tests
@@ -66,6 +67,9 @@ Download the required datasets separately from their providers and place them in
 * `data/raw/mimic_cxr/` — MIMIC-CXR metadata, CheXpert/NegBio labels, and frontal JPEG images.
 
 SapBERT runs locally for biomedical entity linking.
+
+Step 3 currently provides clinical PrimeKG ingestion; retrieval and trajectory
+output are still pending.
 
 ## Usage
 

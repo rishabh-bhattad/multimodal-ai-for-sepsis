@@ -41,6 +41,12 @@ PRIMEKG_RELATION_WHITELIST = [
     "disease_phenotype_negative",
 ]
 
+# Step 3: bounded temporal retrieval (native directed relations are retained).
+SUBGRAPH_TRAJECTORIES_PKL = DATA_INTERIM / "subgraph_trajectories.pkl"
+STEP3_MAX_PATH_LENGTH = 2
+STEP3_MAX_EDGES_PER_WINDOW = 200
+STEP3_SAMPLE_SIZE = 10
+
 # MIMIC-IV item IDs for initial data inspection
 VITAL_ITEM_IDS = {
     "heart_rate": [220045],
