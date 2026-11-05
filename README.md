@@ -1,14 +1,14 @@
-# Multimodal Temporal Graph-RAG for Early Sepsis Detection
+# Multimodal Temporal Graph-RAG for Sepsis Detection
 
 A multimodal research project combining ICU electronic health records, chest radiographs, and biomedical knowledge graphs to estimate sepsis probability from 24 hours of observations.
 
-The planned VLM output contains `sepsis_probability` and `reasoning_chain`, a short evidence-based clinical rationale. There is no separate phenotype prediction. The rationale may mention a possible infection source when supported, with uncertainty stated. Binary Sepsis-3 labels supervise prediction; the generated rationale is evaluated for evidence support without assuming ground-truth explanation labels.
+The planned model output is a sepsis probability and a short, evidence-based clinical rationale.
 
 ---
 
 ## Overview
 
-Clinical trajectories in the ICU are dynamic. This project investigates whether retrieving time-sliced, evolving subgraphs from a biomedical knowledge graph (**PrimeKG**) and integrating them with windowed vitals, labs, and chest radiographs improves early Sepsis-3 prediction and reasoning in vision-language models.
+This project investigates whether preserving the temporal evolution of patient findings and retrieving window-specific biomedical knowledge from **PrimeKG** improves sepsis probability estimation compared with static or no knowledge-graph retrieval. It combines ICU vitals, laboratory measurements, and chest radiographs across four six-hour windows, supporting research toward early sepsis detection.
 
 ### Datasets
 
@@ -32,8 +32,8 @@ multimodal-ai-for-sepsis/
 │   ├── 01_mimic_eda.ipynb    # MIMIC-IV vitals, labs, and CXR metadata inspection
 │   └── 02_primekg_eda.ipynb  # PrimeKG graph exploration and relation checks
 ├── src/
-│   ├── step1_windowing.py    # Cohort selection and temporal alignment
-│   ├── step2_extraction.py   # Radiographic finding extraction
+│   ├── step1_windowing.py    # MIT-LCP cohort derivation and four six-hour windows
+│   ├── step2_extraction.py   # Latest findings, CXR labels, and local SapBERT linking
 │   ├── sql/                 # Cohort queries and MIT-LCP clinical derivations
 │   └── utils.py             # Shared logging and image-download helpers
 └── tests/                   # Pipeline tests
@@ -45,7 +45,7 @@ multimodal-ai-for-sepsis/
 
 ### 1. Environment
 
-Python 3.10 or 3.11 is recommended:
+Use Python 3.11. Create and activate a virtual environment with:
 
 ```bash
 # Create and activate virtual environment
@@ -62,5 +62,20 @@ pip install -r requirements.txt
 Download the required datasets separately from their providers and place them in `data/raw/` (gitignored). MIMIC datasets require approved PhysioNet access.
 
 * `data/raw/primekg/kg.csv` — PrimeKG knowledge graph.
-* `data/raw/mimic_iv/` — MIMIC-IV tables (`icustays`, `chartevents`, `labevents`, `microbiologyevents`, `prescriptions`).
-* `data/raw/mimic_cxr/` — MIMIC-CXR metadata and frontal JPEG images.
+* `data/raw/mimic_iv/` — Compressed MIMIC-IV tables under `hosp/` and `icu/`.
+* `data/raw/mimic_cxr/` — MIMIC-CXR metadata, CheXpert/NegBio labels, and frontal JPEG images.
+
+SapBERT runs locally for biomedical entity linking.
+
+## Usage
+
+With the environment active and Step 1 window data prepared, run a ten-patient extraction check from the repository root:
+
+```bash
+python src/step2_extraction.py \
+  --input data/interim/full_cohort/patient_windows.parquet \
+  --sample_size 10 \
+  --output data/interim/step2_smoke/temporal_quadruples.json
+```
+
+Use `--full` instead of `--sample_size 10` for full processing after a successful check. Patient data must remain on local or institutional hardware.
