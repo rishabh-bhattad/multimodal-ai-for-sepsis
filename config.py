@@ -16,9 +16,7 @@ MIMIC_CXR_DIR = DATA_RAW / "mimic_cxr"
 PRIMEKG_DIR = DATA_RAW / "primekg"
 PRIMEKG_CSV = PRIMEKG_DIR / "kg.csv"
 
-# Cohort CXR downloads; window paths are relative to the remote files/ folder.
-CXR_DOWNLOAD_BASE_URL = "https://physionet.org/files/mimic-cxr-jpg/2.1.0/files"
-CXR_DOWNLOAD_COMMAND = "wget"
+# Cohort CXR download limits; the S3 source and region are entered at runtime.
 CXR_DOWNLOAD_TIMEOUT_SECONDS = (10, 60)
 CXR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 120
 CXR_DOWNLOAD_SAMPLE_SIZE = 1

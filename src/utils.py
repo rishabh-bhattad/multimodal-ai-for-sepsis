@@ -1,5 +1,4 @@
 import argparse
-import getpass
 import logging
 import os
 import re
@@ -9,7 +8,6 @@ import sys
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
-from urllib.parse import quote
 
 import pandas as pd
 from PIL import Image
@@ -38,39 +36,35 @@ def _validate_jpeg(source):
         image.load()
 
 
-def _fetch_cxr(wget, url, auth):
-    """Use genuine Wget for PhysioNet's permitted HTTP-auth client and keep credentials in a pipe.
-
-    Return the process code, final HTTP status, body bytes, and transfer duration; raw logs stay private.
-    """
-    if any(character in auth[1] for character in ("\r", "\n")):
-        raise ValueError("Password must be a single line")
+def _fetch_cxr(aws, source, region, profile=None):
+    """Fetch one S3 image using local AWS credentials without exposing image paths or raw errors."""
     connect_timeout, read_timeout = config.CXR_DOWNLOAD_TIMEOUT_SECONDS
-    command = [wget, "--no-config", "--no-netrc", "--no-hsts", "--server-response",
-               "--ask-password", f"--user={auth[0]}",
-               "--tries=1", f"--dns-timeout={connect_timeout}",
-               f"--connect-timeout={connect_timeout}", f"--read-timeout={read_timeout}",
-               "--max-redirect=0", "--output-document=-", "--", url]
-    env = dict(os.environ, LC_ALL="C")
-    env.pop("WGET_ASKPASS", None)
-    env.pop("SSH_ASKPASS", None)
+    command = [aws, "s3", "cp", source, "-", "--region", region,
+               "--only-show-errors", "--no-cli-pager", "--no-progress",
+               "--cli-connect-timeout", str(connect_timeout),
+               "--cli-read-timeout", str(read_timeout)]
+    if profile:
+        command.extend(["--profile", profile])
     started = perf_counter()
-    # A detached child reads --ask-password from stdin instead of the user's terminal.
-    result = subprocess.run(command, input=(auth[1] + "\n").encode("utf-8"),
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                            start_new_session=True,
+    result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=dict(os.environ, AWS_CLI_AUTO_PROMPT="off"),
                             timeout=config.CXR_DOWNLOAD_TOTAL_TIMEOUT_SECONDS, check=False)
     seconds = perf_counter() - started
-    # Wget's logs can contain patient URLs and cookies; retain only numeric HTTP statuses.
-    statuses = re.findall(rb"^\s*HTTP/\S+\s+(\d{3})\b", result.stderr, re.MULTILINE)
-    status = int(statuses[-1]) if statuses else None
-    return result.returncode, status, result.stdout, seconds
+    # AWS errors may contain patient object keys; retain only a bounded error code.
+    match = re.search(rb"An error occurred \(([A-Za-z0-9_-]{1,64})\)", result.stderr)
+    error_code = match.group(1).decode("ascii") if match else None
+    return result.returncode, error_code, result.stdout, seconds
 
 
 def download_cohort_cxrs(
     parquet_path: Path,
     output_dir: Path,
     sample_size: int | None = config.CXR_DOWNLOAD_SAMPLE_SIZE,
+    profile: str | None = None,
+    *,
+    source_prefix: str,
+    region: str,
 ):
     """Download a bounded set of cohort JPEGs and return aggregate outcomes and transfer speed.
 
@@ -79,6 +73,10 @@ def download_cohort_cxrs(
     logger = setup_logger("CXR-Download")
     if sample_size is not None and sample_size < 1:
         raise ValueError("sample_size must be positive")
+    source_prefix = source_prefix.strip().rstrip("/")
+    region = region.strip()
+    if not source_prefix.startswith("s3://") or not region:
+        raise ValueError("An S3 source prefix and AWS region are required")
     df = pd.read_parquet(parquet_path, columns=["cxr_path"])
     image_paths = df["cxr_path"].dropna().unique().tolist()
     if sample_size is not None:
@@ -88,8 +86,7 @@ def download_cohort_cxrs(
     root = output_dir.resolve()
     logger.info("Selected %d unique images", len(image_paths))
 
-    auth = None
-    wget = None
+    aws = None
     for index, rel_path in enumerate(tqdm(image_paths, desc="CXR attempts"), start=1):
         try:
             relative = Path(rel_path)
@@ -111,40 +108,30 @@ def download_cohort_cxrs(
                 summary["skipped"] += 1
                 continue
 
-        if wget is None:
-            wget = shutil.which(config.CXR_DOWNLOAD_COMMAND)
-            if wget is None:
+        if aws is None:
+            aws = shutil.which("aws")
+            if aws is None:
                 summary["failed"] += 1
-                logger.error("GNU Wget is required for PhysioNet authentication; install it and retry. Stopping.")
+                logger.error("AWS CLI is required; install it and configure credentials. Stopping.")
                 break
-        if auth is None:
-            auth = (input("PhysioNet User: ").strip(), getpass.getpass("PhysioNet Password: "))
-        url = f"{config.CXR_DOWNLOAD_BASE_URL.rstrip('/')}/{quote(relative.as_posix(), safe='/')}"
+        source = f"{source_prefix}/{relative.as_posix()}"
         try:
-            code, status, content, transfer_seconds = _fetch_cxr(wget, url, auth)
+            code, error_code, content, transfer_seconds = _fetch_cxr(aws, source, region, profile)
         except (subprocess.TimeoutExpired, OSError) as exc:
             summary["failed"] += 1
-            logger.error("Image %d: %s; check Wget availability and connection", index, type(exc).__name__)
+            logger.error("Image %d: %s; check AWS CLI availability and connection", index, type(exc).__name__)
             continue
-        if status != 200 or code != 0:
+        if code != 0:
             summary["failed"] += 1
-            if status in (401, 403) or (status is not None and 300 <= status < 400):
-                logger.error("Image %d: HTTP %d; access refused or redirected. Check account/project access. Stopping.", index, status)
-                break
-            if status is not None and status != 200:
-                hint = "check dataset version and remote files/ path" if status == 404 else "server request failed; retry later"
-                logger.error("Image %d: HTTP %d; %s", index, status, hint)
-            else:
-                hint = {4: "network failure or timeout", 5: "TLS certificate verification failed",
-                        6: "authentication failed", 3: "local I/O failure"}.get(code, "transfer failed")
-                logger.error("Image %d: Wget exit %d (%s); nothing saved", index, code, hint)
+            logger.error("Image %d: AWS exit %d (%s); check credentials, dataset access, and connection",
+                         index, code, error_code or "transfer failed")
             continue
 
         try:
             _validate_jpeg(BytesIO(content))
         except (OSError, ValueError, Image.DecompressionBombError):
             summary["failed"] += 1
-            logger.error("Image %d: HTTP 200 contained an invalid JPEG; nothing saved", index)
+            logger.error("Image %d: downloaded content is an invalid JPEG; nothing saved", index)
             continue
 
         tmp_file = local_file.with_suffix(".jpg.part")
@@ -176,9 +163,10 @@ def download_cohort_cxrs(
 
 def main():
     """Expose a one-image access check before an explicit cohort download."""
-    parser = argparse.ArgumentParser(description="Download and validate cohort CXR images from PhysioNet.")
+    parser = argparse.ArgumentParser(description="Download and validate cohort CXR images from S3 using AWS CLI.")
     parser.add_argument("--input", type=Path, default=config.PATIENT_WINDOWS_PARQUET)
     parser.add_argument("--output_dir", type=Path, default=config.MIMIC_CXR_DIR)
+    parser.add_argument("--profile", help="Optional AWS profile; otherwise use the configured AWS credentials")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--sample_size", type=int, default=config.CXR_DOWNLOAD_SAMPLE_SIZE,
                            help="Maximum number of unique images (default: %(default)s)")
@@ -187,7 +175,11 @@ def main():
     if args.sample_size < 1:
         parser.error("--sample_size must be positive")
     try:
-        summary = download_cohort_cxrs(args.input, args.output_dir, None if args.all else args.sample_size)
+        source_prefix = input("S3 source prefix (s3://... ending in /files/): ").strip()
+        region = input("AWS region: ").strip()
+        summary = download_cohort_cxrs(args.input, args.output_dir,
+                                       None if args.all else args.sample_size, args.profile,
+                                       source_prefix=source_prefix, region=region)
     except KeyboardInterrupt:
         setup_logger("CXR-Download").error("Download interrupted")
         return 130
