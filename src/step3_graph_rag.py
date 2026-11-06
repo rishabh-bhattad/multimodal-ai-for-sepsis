@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import sys
+from copy import deepcopy
 from itertools import combinations
 from pathlib import Path
 
@@ -151,3 +152,85 @@ def retrieve_connecting_path_edges(graph, active_nodes, *, connectivity=None,
                 retain_native_edges(source, middle)
                 retain_native_edges(middle, target)
     return tuple(sorted(selected))
+
+
+def retrieve_window_subgraph(graph, active_nodes, *, connectivity=None,
+                             max_path_length=None, max_edges=None):
+    """Retrieve one window's independent, bounded clinical context graph.
+
+    Connecting-path edges have priority over one-hop edges incident to active
+    seeds. Each directed relation counts once against the configured cap;
+    ``max_edges`` can lower that cap, including to zero, but cannot raise it.
+    Within each priority group, native (source, target, relation) ordering
+    determines pruning. If paths alone overflow, individual path edges may be
+    omitted; metadata records this explicitly rather than implying that every
+    retrieved path is complete.
+
+    Neighbor expansion includes incoming and outgoing native edges, including
+    explicitly negative context, but never recursively expands new neighbors.
+    Present seeds survive even without retained edges. Missing seeds remain
+    metadata instead of becoming invented PrimeKG nodes. All retained graph,
+    node, and edge attributes are copied so later windows cannot mutate them.
+    """
+    cap = config.STEP3_MAX_EDGES_PER_WINDOW
+    budget = cap if max_edges is None else max_edges
+    if type(cap) is not int or cap < 0:
+        raise ValueError("Configured edge cap must be a nonnegative integer")
+    if type(budget) is not int or not 0 <= budget <= cap:
+        raise ValueError("Window edge budget must be an integer within the configured cap")
+    requested = set(active_nodes)
+    seeds = requested.intersection(graph)
+    path_edges = retrieve_connecting_path_edges(
+        graph, seeds, connectivity=connectivity, max_path_length=max_path_length
+    )
+    path_edge_set = set(path_edges)
+    allowed_types = set(config.PRIMEKG_ALLOWED_NODE_TYPES)
+    allowed_relations = set(config.PRIMEKG_RELATION_WHITELIST)
+    neighbor_edges = set()
+    for seed in sorted(seeds):
+        incident = set(graph.in_edges(seed, keys=True)) | set(graph.out_edges(seed, keys=True))
+        for source, target, relation in incident:
+            if (graph.nodes[source]["node_type"] in allowed_types
+                    and graph.nodes[target]["node_type"] in allowed_types
+                    and relation in allowed_relations
+                    and (source, target, relation) not in path_edge_set):
+                neighbor_edges.add((source, target, relation))
+
+    retained_paths = path_edges[:budget]
+    retained_neighbors = tuple(sorted(neighbor_edges))[:budget - len(retained_paths)]
+    selected = set(retained_paths) | set(retained_neighbors)
+    selected_nodes = seeds | {node for source, target, _ in selected for node in (source, target)}
+    result = nx.MultiDiGraph()
+    if "provenance" in graph.graph:
+        result.graph["provenance"] = deepcopy(graph.graph["provenance"])
+    for node in sorted(selected_nodes):
+        attributes = deepcopy(graph.nodes[node])
+        attributes["is_active_seed"] = node in seeds
+        result.add_node(node, **attributes)
+    for source, target, relation in sorted(selected):
+        attributes = deepcopy(graph.edges[source, target, relation])
+        attributes["retrieval_role"] = (
+            "connecting_path" if (source, target, relation) in path_edge_set else "one_hop_neighbor"
+        )
+        result.add_edge(source, target, key=relation, **attributes)
+    result.graph["retrieval"] = {
+        "max_edges": budget,
+        "max_path_length": config.STEP3_MAX_PATH_LENGTH if max_path_length is None else max_path_length,
+        "neighbor_expansion": "one_hop_from_active_seeds",
+        "pruning_order": "path_edges_then_neighbor_edges_native_identity",
+        "active_seed_nodes": tuple(sorted(seeds)),
+        "missing_seed_nodes": tuple(sorted(requested - seeds)),
+        "isolated_seed_nodes": tuple(node for node in sorted(seeds) if result.degree(node) == 0),
+        "path_edges_available": len(path_edges),
+        "path_edges_retained": len(retained_paths),
+        "path_edges_pruned": len(path_edges) - len(retained_paths),
+        "neighbor_edges_available": len(neighbor_edges),
+        "neighbor_edges_retained": len(retained_neighbors),
+        "neighbor_edges_pruned": len(neighbor_edges) - len(retained_neighbors),
+        "path_edges_truncated": len(retained_paths) < len(path_edges),
+        "truncated": len(selected) < len(path_edges) + len(neighbor_edges),
+        "negative_association_edges": sum(
+            data["association_polarity"] == "negative" for _, _, data in result.edges(data=True)
+        ),
+    }
+    return result
