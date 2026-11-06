@@ -4,6 +4,7 @@ import csv
 import hashlib
 import sys
 from copy import deepcopy
+from datetime import datetime, timedelta
 from itertools import combinations
 from pathlib import Path
 
@@ -221,6 +222,9 @@ def retrieve_window_subgraph(graph, active_nodes, *, connectivity=None,
         "active_seed_nodes": tuple(sorted(seeds)),
         "missing_seed_nodes": tuple(sorted(requested - seeds)),
         "isolated_seed_nodes": tuple(node for node in sorted(seeds) if result.degree(node) == 0),
+        "seeds_without_connecting_paths": tuple(sorted(
+            seeds - {node for source, target, _ in path_edges for node in (source, target)}
+        )),
         "path_edges_available": len(path_edges),
         "path_edges_retained": len(retained_paths),
         "path_edges_pruned": len(path_edges) - len(retained_paths),
@@ -233,4 +237,119 @@ def retrieve_window_subgraph(graph, active_nodes, *, connectivity=None,
             data["association_polarity"] == "negative" for _, _, data in result.edges(data=True)
         ),
     }
+    return result
+
+
+def _finding_node_key(finding):
+    """Validate the Step 2 mapping contract without changing or rematching it."""
+    required = {"name", "predicate", "source", "value", "node", "similarity",
+                "matched_query", "mapping_status"}
+    if not isinstance(finding, dict) or not required.issubset(finding):
+        raise ValueError("Finding lacks required Step 2 fields")
+    if finding["predicate"] not in ("exhibits", "shows_radiographic"):
+        raise ValueError("Unexpected finding predicate")
+    status, node = finding["mapping_status"], finding["node"]
+    if status == "unresolved":
+        if node is not None:
+            raise ValueError("Unresolved findings must not supply graph seeds")
+        return None
+    if status != "matched" or not isinstance(node, dict):
+        raise ValueError("Finding mapping must be matched or explicitly unresolved")
+    if (node.get("node_type") not in config.PRIMEKG_ALLOWED_NODE_TYPES
+            or not isinstance(node.get("node_id"), str) or not node["node_id"].strip()
+            or not isinstance(node.get("node_name"), str) or not node["node_name"].strip()):
+        raise ValueError("Matched finding lacks a native clinical node identity")
+    return node["node_type"], node["node_id"]
+
+
+def validate_temporal_quadruples(trajectories):
+    """Check all stays and subject splits before any retrieval or sampling.
+
+    Validation is read-only. Errors describe contract failures without quoting
+    patient identifiers, findings, or timestamps. Existing mapping decisions
+    and cohort membership are never recomputed here.
+    """
+    if not isinstance(trajectories, dict) or not trajectories:
+        raise ValueError("Temporal quadruples must contain at least one stay")
+    window_keys = [f"window_{index}" for index in range(config.NUM_WINDOWS)]
+    coverage_states = {"positive", "covered_no_positive", "missing_study", "no_image"}
+    subject_splits = {}
+    for stay_id, stay in trajectories.items():
+        if not isinstance(stay_id, str) or not stay_id.isdecimal() or not isinstance(stay, dict):
+            raise ValueError("Stay records must use native stay-ID string keys")
+        subject, split = stay.get("subject_id"), stay.get("split")
+        if type(subject) is not int or subject <= 0 or split not in ("train", "val", "test"):
+            raise ValueError("Stay lacks valid subject and split metadata")
+        if subject in subject_splits and subject_splits[subject] != split:
+            raise ValueError("Subject split isolation failed")
+        subject_splits[subject] = split
+        windows = stay.get("windows")
+        if not isinstance(windows, dict) or set(windows) != set(window_keys):
+            raise ValueError("Each stay must contain exactly four configured windows")
+        previous_end = None
+        for key in window_keys:
+            window = windows[key]
+            if not isinstance(window, dict):
+                raise ValueError("Window must contain timestamps, findings, and CXR coverage")
+            try:
+                start = datetime.fromisoformat(window["start"])
+                end = datetime.fromisoformat(window["end"])
+                valid_interval = end - start == timedelta(hours=config.WINDOW_SIZE_HOURS)
+                valid_continuity = previous_end is None or start == previous_end
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("Window timestamps must be consistent ISO intervals") from None
+            if not valid_interval or not valid_continuity:
+                raise ValueError("Windows must be contiguous six-hour intervals")
+            previous_end = end
+            coverage = window.get("cxr_coverage")
+            if (not isinstance(coverage, dict) or set(coverage) != {"chexpert", "negbio"}
+                    or any(not isinstance(state, str) or state not in coverage_states
+                           for state in coverage.values())):
+                raise ValueError("Window must preserve both CXR source coverage states")
+            if not isinstance(window.get("findings"), list):
+                raise ValueError("Window findings must be an explicit list, including when empty")
+            for finding in window["findings"]:
+                _finding_node_key(finding)
+
+
+def assemble_subgraph_trajectories(graph, trajectories, *, max_path_length=None, max_edges=None):
+    """Return four independent window graphs per stay with unchanged splits.
+
+    The result retains Step 2's stay/subject grouping. Its ``windows`` mapping
+    contains separate MultiDiGraphs whose metadata holds window index,
+    timestamps, original findings, and separate CXR coverage. Labels, anchors,
+    and other cohort metadata are not graph seeds. Unresolved findings remain
+    observations; matched nodes absent from this graph are recorded separately.
+    No graph or mutable metadata object is shared across stays or windows.
+    """
+    validate_temporal_quadruples(trajectories)
+    connectivity = build_path_connectivity(graph)
+    result = {}
+    for stay_id in sorted(trajectories):
+        stay = trajectories[stay_id]
+        windows = {}
+        for index in range(config.NUM_WINDOWS):
+            key = f"window_{index}"
+            window = stay["windows"][key]
+            finding_keys = [_finding_node_key(finding) for finding in window["findings"]]
+            active_nodes = [node for node in finding_keys if node is not None]
+            subgraph = retrieve_window_subgraph(
+                graph, active_nodes, connectivity=connectivity,
+                max_path_length=max_path_length, max_edges=max_edges,
+            )
+            subgraph.graph.update({
+                "window_idx": index,
+                "start": window["start"], "end": window["end"],
+                "cxr_coverage": deepcopy(window["cxr_coverage"]),
+                "findings": deepcopy(window["findings"]),
+            })
+            retrieval = subgraph.graph["retrieval"]
+            missing = set(retrieval["missing_seed_nodes"])
+            retrieval.update({
+                "matched_findings": len(active_nodes),
+                "unresolved_findings": finding_keys.count(None),
+                "missing_graph_findings": sum(node in missing for node in active_nodes),
+            })
+            windows[key] = subgraph
+        result[stay_id] = {"subject_id": stay["subject_id"], "split": stay["split"], "windows": windows}
     return result
