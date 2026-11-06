@@ -34,7 +34,7 @@ multimodal-ai-for-sepsis/
 ├── src/
 │   ├── step1_windowing.py    # MIT-LCP cohort derivation and four six-hour windows
 │   ├── step2_extraction.py   # Latest findings, CXR labels, and local SapBERT linking
-│   ├── step3_graph_rag.py    # Clinical PrimeKG ingestion; retrieval in progress
+│   ├── step3_graph_rag.py    # Bounded retrieval of four independent window graphs
 │   ├── sql/                 # Cohort queries and MIT-LCP clinical derivations
 │   └── utils.py             # Shared logging and image-download helpers
 └── tests/                   # Pipeline tests
@@ -68,8 +68,11 @@ Download the required datasets separately from their providers and place them in
 
 SapBERT runs locally for biomedical entity linking.
 
-Step 3 currently provides clinical PrimeKG ingestion; retrieval and trajectory
-output are still pending.
+Step 3 retrieves clinical PrimeKG context independently for each of the four
+observation windows. Native directed relations are preserved, including
+explicitly negative associations. Each window is capped at 200 edges, with
+connecting paths prioritized over one-hop neighbors. Empty windows and
+unresolved findings remain explicit.
 
 ## Usage
 
@@ -83,3 +86,60 @@ python src/step2_extraction.py \
 ```
 
 Use `--full` instead of `--sample_size 10` for full processing after a successful check. Patient data must remain on local or institutional hardware.
+
+### Step 3: temporal subgraph retrieval
+
+With Step 2 output available, run a ten-subject retrieval check:
+
+```bash
+python src/step3_graph_rag.py \
+  --input data/interim/full_cohort/temporal_quadruples.json \
+  --primekg data/raw/primekg/kg.csv \
+  --sample_size 10 \
+  --output data/interim/step3_smoke/subgraph_trajectories.pkl
+```
+
+Sampling selects ten unique subjects with one stay each and includes image and
+no-image cases when available. It preserves existing splits and fails if fewer
+than ten subjects are available. Omitting the sampling flags uses the configured
+ten-subject default. Full retrieval requires the explicit `--full` flag:
+
+```bash
+python src/step3_graph_rag.py \
+  --input data/interim/full_cohort/temporal_quadruples.json \
+  --primekg data/raw/primekg/kg.csv \
+  --full \
+  --output data/interim/full_cohort/subgraph_trajectories.pkl
+```
+
+The pickle is keyed by native stay-ID strings. Each stay retains `subject_id`,
+`split`, and a `windows` dictionary containing four separate NetworkX
+`MultiDiGraph` objects (`window_0` through `window_3`). Each graph retains its
+window timestamps, original findings, separate CXR coverage, retrieval counts,
+and graph provenance. Node keys are `(node_type, native_node_id_string)`;
+edge keys retain the native relation. Retrieved diseases are biomedical
+context, not confirmed patient diagnoses.
+
+`step3_validation.json` is written beside the selected pickle. It contains
+aggregate coverage, mapping/retrieval counts, pruning totals, active limits,
+and input/graph/pickle checksums. Keep smoke and full outputs in separate
+directories so their reports remain separate. Patient records stay in local,
+gitignored artifacts; console diagnostics contain aggregate results only.
+
+Run the regression suite from the repository root with:
+
+```bash
+python -m pytest tests/ -q
+```
+
+November 6, 2026 checkpoint: all 128 tests passed, including Step 2-to-Step 3
+integration and retrieval consistency across independent processes. The real
+ten-subject check produced 40 independent graphs, preserving 22 empty-finding
+windows and the existing splits. It retained 1,504 edges; three windows reached
+the 200-edge cap, with no connecting-path edges pruned. A separate saved-output
+audit verified checksums and confirmed that 42 protected source/input files
+were unchanged. Reports are local under `data/interim/step3_smoke/`.
+
+These are functional checks, not clinical performance or SapBERT mapping
+accuracy results. The Step 2 mapping cutoff remains provisional. Full-cohort
+Step 3 retrieval has not been run.
