@@ -1,8 +1,16 @@
 """Load faithful clinical PrimeKG context for isolated temporal retrieval."""
 
+import argparse
 import csv
 import hashlib
+import json
+import logging
+import os
+import pickle
+import random
 import sys
+import tempfile
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta
 from itertools import combinations
@@ -13,6 +21,8 @@ import networkx as nx
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import config
+
+logger = logging.getLogger("Step3-GraphRAG")
 
 
 def load_primekg_graph(path=None):
@@ -353,3 +363,174 @@ def assemble_subgraph_trajectories(graph, trajectories, *, max_path_length=None,
             windows[key] = subgraph
         result[stay_id] = {"subject_id": stay["subject_id"], "split": stay["split"], "windows": windows}
     return result
+
+
+def load_temporal_quadruples(path):
+    """Load exact JSON bytes and their checksum, rejecting ambiguous records."""
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON keys in temporal quadruples")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("Nonfinite JSON constants are not valid Step 2 output")
+
+    payload = Path(path).read_bytes()
+    trajectories = json.loads(payload, object_pairs_hook=unique_keys, parse_constant=reject_constant)
+    return trajectories, hashlib.sha256(payload).hexdigest()
+
+
+def select_trajectories(trajectories, sample_size=config.STEP3_SAMPLE_SIZE):
+    """Select unique smoke subjects reproducibly, or retain all stays with None.
+
+    Prefer an image-bearing representative stay for each subject and include
+    both image/no-image representatives when available and sample size permits.
+    Full mode preserves multiple stays for a subject and existing splits.
+    """
+    validate_temporal_quadruples(trajectories)
+    if sample_size is None:
+        return {key: trajectories[key] for key in sorted(trajectories)}
+    if type(sample_size) is not int or sample_size < 1:
+        raise ValueError("Sample size must be a positive integer")
+
+    def has_image(stay_id):
+        return any(state != "no_image" for window in trajectories[stay_id]["windows"].values()
+                   for state in window["cxr_coverage"].values())
+
+    representatives = {}
+    for stay_id in sorted(trajectories, key=lambda key: (not has_image(key), key)):
+        representatives.setdefault(trajectories[stay_id]["subject_id"], stay_id)
+    if len(representatives) < sample_size:
+        raise ValueError("Fewer unique subjects than requested; full mode was not selected")
+    candidates = sorted(representatives.items())
+    random.Random(config.RANDOM_SEED).shuffle(candidates)
+    coverage_cases = {}
+    for subject, stay_id in candidates:
+        coverage_cases.setdefault(has_image(stay_id), (subject, stay_id))
+    selected = [coverage_cases[case] for case in (True, False) if case in coverage_cases][:sample_size]
+    selected_subjects = {subject for subject, _ in selected}
+    selected.extend((subject, stay_id) for subject, stay_id in candidates
+                    if subject not in selected_subjects)
+    return {key: trajectories[key] for _, key in sorted(selected[:sample_size], key=lambda pair: pair[1])}
+
+
+def summarize_trajectories(trajectories, *, mode, input_sha256):
+    """Return aggregate-only execution diagnostics and file provenance."""
+    stays = list(trajectories.values())
+    windows = [window for stay in stays for window in stay["windows"].values()]
+    subjects = {stay["subject_id"] for stay in stays}
+    patients_per_split = {
+        split: len({stay["subject_id"] for stay in stays if stay["split"] == split})
+        for split in ("train", "val", "test")
+    }
+    retrievals = [window.graph["retrieval"] for window in windows]
+    totals = {field: sum(item[field] for item in retrievals) for field in (
+        "matched_findings", "unresolved_findings", "missing_graph_findings",
+        "path_edges_available", "path_edges_retained", "path_edges_pruned",
+        "neighbor_edges_available", "neighbor_edges_retained", "neighbor_edges_pruned",
+        "negative_association_edges",
+    )}
+    return {
+        "validation": "passed", "mode": mode, "input_sha256": input_sha256,
+        "unique_patients": len(subjects), "stays": len(stays), "windows": len(windows),
+        "patients_per_split": patients_per_split,
+        "stays_per_split": dict(sorted(Counter(stay["split"] for stay in stays).items())),
+        "findings": sum(len(window.graph["findings"]) for window in windows),
+        "empty_finding_windows": sum(not window.graph["findings"] for window in windows),
+        "empty_graph_windows": sum(window.number_of_nodes() == 0 for window in windows),
+        "edgeless_windows": sum(window.number_of_edges() == 0 for window in windows),
+        "windows_with_image": sum(any(state != "no_image" for state in window.graph["cxr_coverage"].values())
+                                  for window in windows),
+        "cxr_coverage_by_window": {
+            source: dict(sorted(Counter(window.graph["cxr_coverage"][source] for window in windows).items()))
+            for source in ("chexpert", "negbio")
+        },
+        "retrieved_edges": sum(window.number_of_edges() for window in windows),
+        "max_edges_in_window": max(window.number_of_edges() for window in windows),
+        "truncated_windows": sum(item["truncated"] for item in retrievals),
+        "path_truncated_windows": sum(item["path_edges_truncated"] for item in retrievals),
+        "isolated_seeds": sum(len(item["isolated_seed_nodes"]) for item in retrievals),
+        "seeds_without_connecting_paths": sum(len(item["seeds_without_connecting_paths"]) for item in retrievals),
+        "limits": {"max_path_length": config.STEP3_MAX_PATH_LENGTH,
+                   "max_edges_per_window": config.STEP3_MAX_EDGES_PER_WINDOW},
+        "graph_provenance": deepcopy(windows[0].graph.get("provenance", {})),
+        "mapping_policy": "preserve_step2_decisions_without_rematching",
+        **totals,
+    }
+
+
+def write_trajectory_outputs(trajectories, report, output_path):
+    """Stage both artifacts before replacing outputs; publish the report last.
+
+    The pickle is streamed, avoiding a second full in-memory serialized copy.
+    Its checksum in the report identifies the matching artifact. Temporary
+    files are created beside the outputs and removed on failure.
+    """
+    output_path = Path(output_path)
+    report_path = output_path.parent / "step3_validation.json"
+    if output_path.resolve() == report_path.resolve():
+        raise ValueError("Pickle and validation report paths must differ")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_paths = []
+    try:
+        with tempfile.NamedTemporaryFile(mode="w+b", dir=output_path.parent,
+                                         prefix=".step3-", suffix=".tmp", delete=False) as staged:
+            pickle_path = Path(staged.name)
+            temporary_paths.append(pickle_path)
+            pickle.dump(trajectories, staged, protocol=pickle.HIGHEST_PROTOCOL)
+            staged.flush()
+            staged.seek(0)
+            digest = hashlib.file_digest(staged, "sha256").hexdigest()
+        published_report = {**report, "pickle_sha256": digest, "pickle_protocol": pickle.HIGHEST_PROTOCOL}
+        report_bytes = (json.dumps(published_report, indent=2, allow_nan=False) + "\n").encode("utf-8")
+        with tempfile.NamedTemporaryFile(mode="wb", dir=output_path.parent,
+                                         prefix=".step3-", suffix=".tmp", delete=False) as staged:
+            json_path = Path(staged.name)
+            temporary_paths.append(json_path)
+            staged.write(report_bytes)
+        os.replace(pickle_path, output_path)
+        os.replace(json_path, report_path)
+        return published_report
+    finally:
+        for temporary_path in temporary_paths:
+            temporary_path.unlink(missing_ok=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Retrieve four isolated temporal PrimeKG subgraphs per stay.")
+    parser.add_argument("--input", type=Path, default=config.TEMPORAL_QUADRUPLES_JSON)
+    parser.add_argument("--primekg", type=Path, default=config.PRIMEKG_CSV)
+    parser.add_argument("--output", type=Path, default=config.SUBGRAPH_TRAJECTORIES_PKL)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--sample_size", type=int, default=config.STEP3_SAMPLE_SIZE)
+    mode.add_argument("--full", action="store_true")
+    args = parser.parse_args(argv)
+    if not args.full and args.sample_size < 1:
+        parser.error("--sample_size must be positive")
+    if args.output.suffix.lower() != ".pkl":
+        parser.error("--output must use the .pkl extension")
+    try:
+        protected = {args.input.resolve(), args.primekg.resolve()}
+        targets = {args.output.resolve(), (args.output.parent / "step3_validation.json").resolve()}
+        if protected.intersection(targets):
+            raise ValueError("Output paths must not overwrite input artifacts")
+        trajectories, digest = load_temporal_quadruples(args.input)
+        selected = select_trajectories(trajectories, None if args.full else args.sample_size)
+        graph = load_primekg_graph(args.primekg)
+        result = assemble_subgraph_trajectories(graph, selected)
+        summary = summarize_trajectories(result, mode="full" if args.full else "sample", input_sha256=digest)
+        summary = write_trajectory_outputs(result, summary, args.output)
+        logger.info("Step 3 summary: %s", json.dumps(summary, sort_keys=True))
+    except Exception as exc:
+        # Filesystem/parser exceptions may contain patient paths or record data.
+        logger.error("Step 3 failed (%s); inspect locally using synthetic inputs", type(exc).__name__)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+    sys.exit(main())
