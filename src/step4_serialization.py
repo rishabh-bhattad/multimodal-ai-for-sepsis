@@ -9,7 +9,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 
@@ -353,4 +353,137 @@ def serialize_window_block(
     img = image_line if image_line is not None else f"- Image: {config.STEP4_NO_IMAGE_PLACEHOLDER}"
     kg_text = serialize_subgraph_edges(subgraph, max_edges=max_edges)
     return f"{header}\n{vitals}\n{labs}\n{img}\n{kg_text}"
+
+
+def resolve_image_path(
+    cxr_path: Optional[Any],
+    cxr_dir: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    """Resolve an image path to a normalized string path.
+
+    Parameters
+    ----------
+    cxr_path : str, Path, or None
+        Relative or absolute path to a radiograph file.
+    cxr_dir : str or Path, optional
+        Base directory for relative CXR paths (defaults to config.MIMIC_CXR_DIR).
+
+    Returns
+    -------
+    str or None
+        Normalized path string, or None if cxr_path is missing/empty/NaN.
+    """
+    if cxr_path is None:
+        return None
+    try:
+        if isinstance(cxr_path, float) and math.isnan(cxr_path):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    path_str = str(cxr_path).strip()
+    if not path_str or path_str.lower() in ("nan", "none"):
+        return None
+
+    path_obj = Path(path_str)
+    if path_obj.is_absolute():
+        return str(path_obj)
+
+    base = Path(config.MIMIC_CXR_DIR if cxr_dir is None else cxr_dir)
+    return str(base / path_obj)
+
+
+def assemble_multimodal_prompt(
+    stay_windows: List[Dict[str, Any]],
+    subgraphs: Optional[Dict[str, nx.MultiDiGraph]] = None,
+    cxr_dir: Optional[Union[str, Path]] = None,
+    max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
+) -> Tuple[str, List[str]]:
+    """Assemble a 24-hour multimodal prompt from four chronological observation windows.
+
+    Combines system context, four chronological 6-hour window text blocks with
+    aligned CXR image placeholders and serialized PrimeKG subgraphs, and the final
+    target task instructions.
+
+    Parameters
+    ----------
+    stay_windows : list of dict
+        List of four window records for a single stay, ordered window_idx 0 to 3.
+    subgraphs : dict of str -> nx.MultiDiGraph, optional
+        Retrieved subgraphs for this stay, keyed by 'window_0' .. 'window_3'.
+    cxr_dir : str or Path, optional
+        Base directory containing chest radiographs (defaults to config.MIMIC_CXR_DIR).
+    max_edges_per_window : int
+        Maximum PrimeKG edges to serialize per window.
+
+    Returns
+    -------
+    prompt_text : str
+        The complete multimodal prompt string containing <image> tags in chronological order.
+    image_paths : list of str
+        List of resolved image paths matching the exact order and count of <image> tags.
+
+    Raises
+    ------
+    ValueError
+        If stay_windows does not contain exactly four windows, if window indices are invalid
+        or out of order, or if the <image> placeholder count does not match len(image_paths).
+    """
+    if len(stay_windows) != config.NUM_WINDOWS:
+        raise ValueError(
+            f"Expected exactly {config.NUM_WINDOWS} windows per stay, got: {len(stay_windows)}"
+        )
+
+    # Sort and validate window continuity
+    sorted_windows = sorted(stay_windows, key=lambda w: w.get("window_idx", -1))
+    for expected_idx, win in enumerate(sorted_windows):
+        win_idx = win.get("window_idx")
+        if win_idx != expected_idx:
+            raise ValueError(
+                f"Windows must have sequential indices 0..{config.NUM_WINDOWS - 1}. "
+                f"Expected index {expected_idx}, got {win_idx}"
+            )
+
+    window_blocks: List[str] = []
+    image_paths: List[str] = []
+
+    for idx, win in enumerate(sorted_windows):
+        cxr_path = win.get("cxr_path")
+        resolved_img = resolve_image_path(cxr_path, cxr_dir=cxr_dir)
+        if resolved_img is not None:
+            image_line = f"- Image: {config.STEP4_IMAGE_PLACEHOLDER}"
+            image_paths.append(resolved_img)
+        else:
+            image_line = f"- Image: {config.STEP4_NO_IMAGE_PLACEHOLDER}"
+
+        sg = None
+        if subgraphs is not None:
+            sg = subgraphs.get(f"window_{idx}")
+
+        block = serialize_window_block(
+            window_idx=idx,
+            window_data=win,
+            subgraph=sg,
+            image_line=image_line,
+            max_edges=max_edges_per_window,
+        )
+        window_blocks.append(block)
+
+    prompt_sections = [
+        config.STEP4_SYSTEM_CONTEXT,
+        *window_blocks,
+        config.STEP4_TARGET_TASK,
+    ]
+    prompt_text = "\n\n".join(prompt_sections)
+
+    # Verify placeholder-to-path 1-to-1 contract
+    placeholder_count = prompt_text.count("<image>")
+    if placeholder_count != len(image_paths):
+        raise ValueError(
+            f"Mismatch between <image> placeholders ({placeholder_count}) and "
+            f"resolved image paths ({len(image_paths)})"
+        )
+
+    return prompt_text, image_paths
+
 
