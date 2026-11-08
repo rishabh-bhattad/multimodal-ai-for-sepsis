@@ -45,6 +45,38 @@ STEP3_MAX_PATH_LENGTH = 2
 STEP3_MAX_EDGES_PER_WINDOW = 200
 STEP3_SAMPLE_SIZE = 10
 
+# Step 4: Chronological prompt serialization and Hugging Face dataset building
+TOKENIZED_DATASET_DIR = DATA_INTERIM / "tokenized_dataset"
+STEP4_VALIDATION_JSON = DATA_INTERIM / "step4_validation.json"
+STEP4_SAMPLE_SIZE = 10
+STEP4_MAX_SEQ_LENGTH = 4096
+
+STEP4_TARGET_COMPLETION_POSITIVE = "Sepsis"
+STEP4_TARGET_COMPLETION_NEGATIVE = "Non-Sepsis"
+STEP4_CLASS_LABELS = {0: "Non-Sepsis", 1: "Sepsis"}
+
+STEP4_SYSTEM_CONTEXT = (
+    "You are an expert ICU Clinical Decision Support AI. Analyze the patient's "
+    "chronological trajectory across the past 24 hours, integrating structured vitals, "
+    "laboratory shifts, chest radiographs, and retrieved biomedical knowledge graph pathways. "
+    "Estimate the probability of sepsis from the complete 24-hour trajectory. Provide a short "
+    "evidence summary distinguishing observations from retrieved context. Mention a possible "
+    "infection source only when supported, and state uncertainty."
+)
+
+STEP4_TARGET_TASK = (
+    "Evaluate the chronological evidence. Respond ONLY with a valid JSON object matching this schema:\n"
+    "{\n"
+    '  "sepsis_probability": <float between 0.0 and 1.0>,\n'
+    '  "reasoning_chain": "<short evidence-based clinical rationale; state uncertainty and distinguish observations from retrieved context>"\n'
+    "}"
+)
+
+STEP4_IMAGE_PLACEHOLDER = "<image> Frontal Chest Radiograph acquired."
+STEP4_NO_IMAGE_PLACEHOLDER = "No chest radiograph acquired in this window."
+STEP4_BASELINE_KG_TEXT = "[Normal Physiological Baseline]."
+STEP4_NO_KG_TEXT = "[No biomedical knowledge graph pathways retrieved for this window.]"
+
 # MIMIC-IV item IDs for initial data inspection
 VITAL_ITEM_IDS = {
     "heart_rate": [220045],
