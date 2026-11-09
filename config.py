@@ -146,8 +146,44 @@ SAPBERT_UNMATCHED_CHECKS = ["No finding documented", "qzxv nonexistent observati
 STEP2_SAMPLE_SIZE = 10
 STEP2_CSV_CHUNK_SIZE = 50000
 
-# Vision-Language Model backbone (Step 5)
+# Step 5: Model Training, Inference & Baseline Comparisons
 BASE_LVLM_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
+CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+STEP5_RESULTS_DIR = DATA_INTERIM / "step5_results"
+STEP5_VALIDATION_JSON = DATA_INTERIM / "step5_validation.json"
+
+# PEFT LoRA configuration
+STEP5_LORA_R = 16
+STEP5_LORA_ALPHA = 32
+STEP5_LORA_DROPOUT = 0.05
+STEP5_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+STEP5_LORA_BIAS = "none"
+
+# Training hyperparameters
+STEP5_LEARNING_RATE = 2e-4
+STEP5_BATCH_SIZE = 1
+STEP5_GRADIENT_ACCUMULATION_STEPS = 16
+STEP5_EFFECTIVE_BATCH_SIZE = STEP5_BATCH_SIZE * STEP5_GRADIENT_ACCUMULATION_STEPS  # 16
+STEP5_EPOCHS = 3
+STEP5_WARMUP_RATIO = 0.03
+STEP5_WEIGHT_DECAY = 0.01
+STEP5_MAX_GRAD_NORM = 1.0
+STEP5_LOGGING_STEPS = 10
+STEP5_EVAL_STRATEGY = "epoch"
+STEP5_SAVE_STRATEGY = "epoch"
+
+# Model variants / comparisons
+STEP5_MODEL_VARIANTS = ["trag", "static_rag", "no_kg", "xgboost"]
+STEP5_SMOKE_SAMPLE_SIZE = 10
+
+# XGBoost baseline parameters
+STEP5_XGB_MAX_DEPTH = 4
+STEP5_XGB_LEARNING_RATE = 0.05
+STEP5_XGB_N_ESTIMATORS = 100
+STEP5_XGB_SUBSAMPLE = 0.8
+STEP5_XGB_COLSAMPLE_BYTREE = 0.8
+
 
 # local MIT-LCP derivations and 24-hour observations
 MIT_LCP_REVISION = "303d26c623dcc9c49cc0f204468d4acc2f063797"
