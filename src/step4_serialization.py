@@ -487,3 +487,207 @@ def assemble_multimodal_prompt(
     return prompt_text, image_paths
 
 
+def tokenize_and_mask_labels(
+    prompt_text: str,
+    target_completion: str,
+    tokenizer: Any,
+    max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
+) -> Dict[str, List[int]]:
+    """Tokenize a prompt and target completion with causal target-only loss masking.
+
+    All prompt and vision tokens are assigned a label of -100 so that causal language
+    modeling loss is computed exclusively on the target completion tokens.
+
+    Parameters
+    ----------
+    prompt_text : str
+        The serialized prompt text.
+    target_completion : str
+        The canonical binary target completion ("Sepsis" or "Non-Sepsis").
+    tokenizer : Any
+        Hugging Face tokenizer or callable with encode / call interface.
+    max_seq_length : int
+        Maximum allowed token sequence length. Truncates prompt from left if exceeded.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - "input_ids": list of int
+        - "attention_mask": list of int
+        - "labels": list of int (with -100 for prompt tokens, token IDs for target)
+    """
+    full_text = f"{prompt_text.rstrip()}\n{target_completion.strip()}"
+    prompt_clean = prompt_text.rstrip()
+
+    if hasattr(tokenizer, "__call__"):
+        full_enc = tokenizer(full_text, add_special_tokens=True)
+        full_ids = list(full_enc["input_ids"])
+        full_mask = list(full_enc.get("attention_mask", [1] * len(full_ids)))
+        prompt_enc = tokenizer(prompt_clean, add_special_tokens=True)
+        prompt_ids = list(prompt_enc["input_ids"])
+    elif hasattr(tokenizer, "encode"):
+        full_ids = list(tokenizer.encode(full_text))
+        full_mask = [1] * len(full_ids)
+        prompt_ids = list(tokenizer.encode(prompt_clean))
+    else:
+        raise TypeError(f"Tokenizer {type(tokenizer).__name__} does not have __call__ or encode")
+
+    prompt_len = min(len(prompt_ids), len(full_ids) - 1)
+    if prompt_len < 0:
+        prompt_len = 0
+
+    labels = [-100] * prompt_len + full_ids[prompt_len:]
+
+    # Truncate from the left if sequence exceeds max_seq_length, preserving target tokens
+    if len(full_ids) > max_seq_length:
+        excess = len(full_ids) - max_seq_length
+        full_ids = full_ids[excess:]
+        full_mask = full_mask[excess:]
+        labels = labels[excess:]
+
+    # Guard: Ensure at least one token is active in labels (not all -100)
+    if all(lbl == -100 for lbl in labels) and labels:
+        labels[-1] = full_ids[-1]
+
+    return {
+        "input_ids": full_ids,
+        "attention_mask": full_mask,
+        "labels": labels,
+    }
+
+
+def build_stay_example(
+    stay_id: Union[int, str],
+    subject_id: Union[int, str],
+    split: str,
+    stay_windows: List[Dict[str, Any]],
+    label: int,
+    subgraphs: Optional[Dict[str, nx.MultiDiGraph]] = None,
+    tokenizer: Optional[Any] = None,
+    cxr_dir: Optional[Union[str, Path]] = None,
+    max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
+    max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
+) -> Dict[str, Any]:
+    """Build a single serialized and optionally tokenized patient stay record.
+
+    Parameters
+    ----------
+    stay_id : int or str
+        ICU stay identifier.
+    subject_id : int or str
+        Patient subject identifier.
+    split : str
+        Data split ('train', 'val', or 'test').
+    stay_windows : list of dict
+        The four chronological 6-hour windows for this stay.
+    label : int
+        Binary Sepsis-3 label (0 or 1).
+    subgraphs : dict of str -> nx.MultiDiGraph, optional
+        Retrieved subgraphs for this stay.
+    tokenizer : Any, optional
+        Tokenizer for encoding and causal loss masking.
+    cxr_dir : str or Path, optional
+        Base directory containing chest radiographs.
+    max_seq_length : int
+        Maximum sequence length for tokenization.
+    max_edges_per_window : int
+        Maximum PrimeKG edges per window.
+
+    Returns
+    -------
+    dict
+        Dataset record matching the Hugging Face contract.
+    """
+    target_completion = get_target_completion(label)
+    prompt_text, image_paths = assemble_multimodal_prompt(
+        stay_windows=stay_windows,
+        subgraphs=subgraphs,
+        cxr_dir=cxr_dir,
+        max_edges_per_window=max_edges_per_window,
+    )
+
+    norm_split = "validation" if split in ("val", "validation") else split
+
+    record: Dict[str, Any] = {
+        "stay_id": int(stay_id),
+        "subject_id": int(subject_id),
+        "split": norm_split,
+        "prompt_text": prompt_text,
+        "image_paths": image_paths,
+        "target_completion": target_completion,
+        "label": int(label),
+    }
+
+    if tokenizer is not None:
+        tokenized = tokenize_and_mask_labels(
+            prompt_text=prompt_text,
+            target_completion=target_completion,
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+        )
+        record.update(tokenized)
+
+    return record
+
+
+def build_huggingface_dataset(
+    examples: List[Dict[str, Any]],
+) -> Any:
+    """Build a Hugging Face DatasetDict partitioned by train, validation, and test splits.
+
+    Parameters
+    ----------
+    examples : list of dict
+        List of stay records with 'split' ('train', 'validation', 'test').
+
+    Returns
+    -------
+    datasets.DatasetDict
+        DatasetDict containing train, validation, and test Hugging Face Dataset objects.
+
+    Raises
+    ------
+    ValueError
+        If subject isolation is violated (same subject appears in multiple splits).
+    """
+    from datasets import Dataset, DatasetDict
+
+    splits_data: Dict[str, List[Dict[str, Any]]] = {
+        "train": [],
+        "validation": [],
+        "test": [],
+    }
+
+    subjects_by_split: Dict[str, set] = {
+        "train": set(),
+        "validation": set(),
+        "test": set(),
+    }
+
+    for ex in examples:
+        raw_split = ex.get("split", "train")
+        split_name = "validation" if raw_split in ("val", "validation") else raw_split
+        if split_name not in splits_data:
+            raise ValueError(f"Unknown split name: {raw_split}")
+
+        # Drop the redundant 'split' column from the row before dataset conversion
+        row = {k: v for k, v in ex.items() if k != "split"}
+        splits_data[split_name].append(row)
+        subjects_by_split[split_name].add(ex["subject_id"])
+
+    # Enforce strict subject-level split isolation
+    for s1, s2 in [("train", "validation"), ("train", "test"), ("validation", "test")]:
+        overlap = subjects_by_split[s1].intersection(subjects_by_split[s2])
+        if overlap:
+            raise ValueError(
+                f"Subject split isolation violated: {len(overlap)} subjects overlap between {s1} and {s2}"
+            )
+
+    return DatasetDict({
+        name: Dataset.from_list(rows if rows else [])
+        for name, rows in splits_data.items()
+    })
+
+
+
