@@ -152,6 +152,8 @@ CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
 CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 STEP5_RESULTS_DIR = DATA_INTERIM / "step5_results"
 STEP5_VALIDATION_JSON = DATA_INTERIM / "step5_validation.json"
+TOKENIZED_DATASET_STATIC_RAG_DIR = DATA_INTERIM / "tokenized_dataset_static_rag"
+TOKENIZED_DATASET_NO_KG_DIR = DATA_INTERIM / "tokenized_dataset_no_kg"
 
 # PEFT LoRA configuration
 STEP5_LORA_R = 16
