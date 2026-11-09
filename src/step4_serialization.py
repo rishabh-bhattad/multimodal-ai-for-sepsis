@@ -5,17 +5,27 @@ aligned chest radiographs, and isolated PrimeKG biomedical subgraphs across four
 6-hour observation windows.
 """
 
+import argparse
+import hashlib
 import json
+import logging
 import math
+import os
+import pickle
+import random
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
+import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import config
+
+logger = logging.getLogger("Step4-Serialization")
 
 
 def get_target_completion(label: int) -> str:
@@ -690,4 +700,287 @@ def build_huggingface_dataset(
     })
 
 
+def compute_file_sha256(path: Path) -> str:
+    """Compute sha256 checksum of a file in streaming chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_trajectories_pickle(path: Path) -> Tuple[Dict[str, Any], str]:
+    """Load Step 3 subgraph trajectories pickle and compute its checksum."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Trajectories pickle not found: {path}")
+    digest = compute_file_sha256(p)
+    with p.open("rb") as f:
+        trajectories = pickle.load(f)
+    if not isinstance(trajectories, dict):
+        raise ValueError("Trajectories pickle must be a dict keyed by stay_id")
+    return trajectories, digest
+
+
+def load_patient_windows_parquet(path: Path) -> Tuple[pd.DataFrame, str]:
+    """Load Step 1 patient windows parquet and compute its checksum."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Patient windows parquet not found: {path}")
+    digest = compute_file_sha256(p)
+    df = pd.read_parquet(p)
+    required = {"stay_id", "subject_id", "window_idx", "split", "label"}
+    if not required.issubset(df.columns):
+        missing = required - set(df.columns)
+        raise ValueError(f"Patient windows parquet missing required columns: {missing}")
+    return df, digest
+
+
+def select_stays_for_dataset(
+    trajectories: Dict[str, Any],
+    windows_df: pd.DataFrame,
+    sample_size: Optional[int] = config.STEP4_SAMPLE_SIZE,
+) -> List[int]:
+    """Select eligible stay IDs deterministically, preserving patient splits and image coverage.
+
+    If sample_size is None, returns all eligible stay IDs.
+    """
+    traj_stay_ids = {int(k) for k in trajectories.keys()}
+    win_stay_ids = set(windows_df["stay_id"].unique())
+    common_stay_ids = sorted(traj_stay_ids.intersection(win_stay_ids))
+
+    if not common_stay_ids:
+        raise ValueError("No common stay IDs between trajectories and patient windows")
+
+    if sample_size is None or len(common_stay_ids) <= sample_size:
+        return common_stay_ids
+
+    sub_df = windows_df[windows_df["stay_id"].isin(common_stay_ids)].drop_duplicates("stay_id")
+    sub_df = sub_df.assign(has_image=sub_df["cxr_path"].notna() if "cxr_path" in sub_df.columns else False)
+
+    representatives: Dict[int, int] = {}
+    for row in sub_df.sort_values(["has_image", "stay_id"], ascending=[False, True]).to_dict("records"):
+        representatives.setdefault(row["subject_id"], row["stay_id"])
+
+    candidates = sorted(representatives.items())
+    rng = random.Random(config.RANDOM_SEED)
+    rng.shuffle(candidates)
+
+    coverage_cases: Dict[bool, Tuple[int, int]] = {}
+    stay_to_img = dict(zip(sub_df["stay_id"], sub_df["has_image"]))
+    for sub, sid in candidates:
+        coverage_cases.setdefault(stay_to_img.get(sid, False), (sub, sid))
+
+    selected = [coverage_cases[k] for k in (True, False) if k in coverage_cases][:sample_size]
+    selected_subs = {s for s, _ in selected}
+    selected.extend((s, sid) for s, sid in candidates if s not in selected_subs)
+
+    final_stays = [sid for _, sid in sorted(selected[:sample_size], key=lambda x: x[1])]
+    return final_stays
+
+
+def summarize_dataset(
+    dataset_dict: Any,
+    mode: str,
+    windows_sha256: str,
+    trajectories_sha256: str,
+) -> Dict[str, Any]:
+    """Return aggregate-only execution diagnostics and dataset provenance without PHI."""
+    all_rows = [row for split in dataset_dict.values() for row in split]
+    unique_patients = len({row["subject_id"] for row in all_rows})
+    total_stays = len(all_rows)
+    total_windows = total_stays * config.NUM_WINDOWS
+
+    stays_per_label = dict(sorted(Counter(row["label"] for row in all_rows).items()))
+    stays_per_split = {name: len(ds) for name, ds in dataset_dict.items()}
+    patients_per_split = {
+        name: len({row["subject_id"] for row in ds})
+        for name, ds in dataset_dict.items()
+    }
+
+    stays_with_images = sum(len(row["image_paths"]) > 0 for row in all_rows)
+    total_images = sum(len(row["image_paths"]) for row in all_rows)
+
+    has_tokens = ("input_ids" in all_rows[0] and bool(all_rows[0]["input_ids"])) if all_rows else False
+    token_summary = None
+    active_tokens = 0
+    masked_tokens = 0
+
+    if has_tokens:
+        lengths = sorted(len(row["input_ids"]) for row in all_rows)
+        n = len(lengths)
+        token_summary = {
+            "min": lengths[0],
+            "p50": lengths[n // 2],
+            "p90": lengths[int(n * 0.9)],
+            "p99": lengths[min(int(n * 0.99), n - 1)],
+            "max": lengths[-1],
+        }
+        for row in all_rows:
+            for lbl in row.get("labels", []):
+                if lbl == -100:
+                    masked_tokens += 1
+                else:
+                    active_tokens += 1
+
+    summary = {
+        "validation": "passed",
+        "mode": mode,
+        "unique_patients": unique_patients,
+        "stays": total_stays,
+        "windows": total_windows,
+        "stays_per_label": {str(k): v for k, v in stays_per_label.items()},
+        "patients_per_split": patients_per_split,
+        "stays_per_split": stays_per_split,
+        "stays_with_images": stays_with_images,
+        "total_images_referenced": total_images,
+        "tokenized": has_tokens,
+        "token_length_summary": token_summary,
+        "active_supervision_tokens": active_tokens,
+        "masked_tokens": masked_tokens,
+        "input_sha256": {
+            "windows": windows_sha256,
+            "trajectories": trajectories_sha256,
+        },
+    }
+    return summary
+
+
+def run_step4_pipeline(
+    windows_path: Path,
+    trajectories_path: Path,
+    output_dir: Path,
+    sample_size: Optional[int] = config.STEP4_SAMPLE_SIZE,
+    full: bool = False,
+    tokenizer_name: Optional[str] = None,
+    cxr_dir: Optional[Path] = None,
+    max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
+    max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
+) -> Dict[str, Any]:
+    """Execute the complete Step 4 prompt serialization and dataset assembly pipeline."""
+    windows_p = Path(windows_path)
+    trajectories_p = Path(trajectories_path)
+    output_p = Path(output_dir)
+
+    trajectories, traj_digest = load_trajectories_pickle(trajectories_p)
+    windows_df, win_digest = load_patient_windows_parquet(windows_p)
+
+    selected_stays = select_stays_for_dataset(
+        trajectories=trajectories,
+        windows_df=windows_df,
+        sample_size=None if full else sample_size,
+    )
+
+    tokenizer = None
+    if tokenizer_name:
+        from transformers import AutoTokenizer
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+        except Exception as exc:
+            logger.warning("Could not load tokenizer %s (%s); proceeding without tokenization",
+                           tokenizer_name, type(exc).__name__)
+
+    selected_df = windows_df[windows_df["stay_id"].isin(selected_stays)]
+    stays_grouped = selected_df.groupby("stay_id")
+
+    examples = []
+    for sid in sorted(selected_stays):
+        stay_rows = stays_grouped.get_group(sid).sort_values("window_idx").to_dict("records")
+        if len(stay_rows) != config.NUM_WINDOWS:
+            raise ValueError(f"Stay {sid} does not retain exactly {config.NUM_WINDOWS} windows")
+
+        subject_id = stay_rows[0]["subject_id"]
+        split = stay_rows[0]["split"]
+        label = stay_rows[0]["label"]
+
+        traj_entry = trajectories.get(str(sid), trajectories.get(sid, {}))
+        subgraphs = traj_entry.get("windows") if isinstance(traj_entry, dict) else None
+
+        ex = build_stay_example(
+            stay_id=sid,
+            subject_id=subject_id,
+            split=split,
+            stay_windows=stay_rows,
+            label=label,
+            subgraphs=subgraphs,
+            tokenizer=tokenizer,
+            cxr_dir=cxr_dir,
+            max_seq_length=max_seq_length,
+            max_edges_per_window=max_edges_per_window,
+        )
+        examples.append(ex)
+
+    dataset_dict = build_huggingface_dataset(examples)
+
+    output_p.mkdir(parents=True, exist_ok=True)
+    dataset_dict.save_to_disk(str(output_p))
+
+    mode_str = "full" if full else "sample"
+    summary = summarize_dataset(
+        dataset_dict=dataset_dict,
+        mode=mode_str,
+        windows_sha256=win_digest,
+        trajectories_sha256=traj_digest,
+    )
+
+    report_path = output_p.parent / "step4_validation.json"
+    report_path.write_text(json.dumps(summary, indent=2) + "\n")
+    return summary
+
+
+def main(argv=None):
+    """CLI entrypoint for Step 4 prompt serialization and dataset building."""
+    parser = argparse.ArgumentParser(
+        description="Step 4: Build chronological multimodal prompts and Hugging Face DatasetDict."
+    )
+    parser.add_argument("--windows", type=Path, default=config.PATIENT_WINDOWS_PARQUET,
+                        help="Path to patient_windows.parquet")
+    parser.add_argument("--trajectories", type=Path, default=config.SUBGRAPH_TRAJECTORIES_PKL,
+                        help="Path to subgraph_trajectories.pkl")
+    parser.add_argument("--output", type=Path, default=config.TOKENIZED_DATASET_DIR,
+                        help="Output directory for Hugging Face DatasetDict")
+    parser.add_argument("--cxr_dir", type=Path, default=config.MIMIC_CXR_DIR,
+                        help="Directory containing CXR images")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="Hugging Face tokenizer name or path")
+    parser.add_argument("--max_seq_length", type=int, default=config.STEP4_MAX_SEQ_LENGTH,
+                        help="Maximum sequence length")
+    parser.add_argument("--max_edges", type=int, default=config.STEP3_MAX_EDGES_PER_WINDOW,
+                        help="Maximum PrimeKG edges per window")
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--sample_size", type=int, default=None,
+                        help="Number of unique subjects for smoke run")
+    mode.add_argument("--full", action="store_true",
+                        help="Process the full eligible cohort")
+
+    args = parser.parse_args(argv)
+
+    if args.sample_size is None and not args.full:
+        args.sample_size = config.STEP4_SAMPLE_SIZE
+    if not args.full and args.sample_size < 1:
+        parser.error("--sample_size must be positive")
+
+    try:
+        summary = run_step4_pipeline(
+            windows_path=args.windows,
+            trajectories_path=args.trajectories,
+            output_dir=args.output,
+            sample_size=args.sample_size,
+            full=args.full,
+            tokenizer_name=args.tokenizer,
+            cxr_dir=args.cxr_dir,
+            max_seq_length=args.max_seq_length,
+            max_edges_per_window=args.max_edges,
+        )
+        logger.info("Step 4 complete: %s", json.dumps(summary, sort_keys=True))
+    except Exception as exc:
+        logger.error("Step 4 failed (%s); inspect locally using synthetic inputs", type(exc).__name__)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+    sys.exit(main())
 
