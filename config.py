@@ -3,6 +3,7 @@ Configuration for data paths, exploratory checks, and active pipeline settings.
 Additional parameters for future steps are maintained in config_reference.py.
 """
 
+import os
 from pathlib import Path
 
 # Paths
@@ -138,7 +139,15 @@ SAPBERT_SIMILARITY_THRESHOLD = 0.70
 SAPBERT_MODEL_REVISION = "090663c3ae57bf35ffe4d0d468a2a88d03051a4d"
 SAPBERT_BATCH_SIZE = 128
 SAPBERT_MAX_LENGTH = 32
-SAPBERT_THREADS = 2
+SAPBERT_THREADS = 8
+# Use the A100 when available; set SAPBERT_DEVICE=cpu to force CPU execution.
+SAPBERT_DEVICE = os.environ.get("SAPBERT_DEVICE", "auto")
+# First run downloads the pinned public model; subsequent runs prefer the cache.
+SAPBERT_OFFLINE = (
+    os.environ.get("SAPBERT_OFFLINE", "0").lower() in {"1", "true", "yes"}
+    or os.environ.get("HF_HUB_OFFLINE", "0").lower() in {"1", "true", "yes"}
+    or os.environ.get("TRANSFORMERS_OFFLINE", "0").lower() in {"1", "true", "yes"}
+)
 SAPBERT_MAPPINGS_JSON = DATA_INTERIM / "sapbert_finding_mappings.json"
 # Chest-radiograph edema has pulmonary context; retain the original source label in output.
 CXR_MAPPING_QUERIES = {"Edema": "Pulmonary edema"}
@@ -223,10 +232,11 @@ TRAIN_FRACTION = 0.70
 VALIDATION_FRACTION = 0.15
 STEP1_SAMPLE_SIZE = 10
 STEP1_CANDIDATE_MULTIPLIER = 20
-DUCKDB_THREADS = 2
-DUCKDB_MEMORY_LIMIT = "12GB"
+# Sized for 32 logical CPUs and approximately 115 GiB host RAM.
+DUCKDB_THREADS = 16
+DUCKDB_MEMORY_LIMIT = "64GB"
 DUCKDB_TEMP_DIR = DATA_INTERIM / "duckdb_tmp"
-DUCKDB_MAX_TEMP_DIRECTORY_SIZE = "100GB"
+DUCKDB_MAX_TEMP_DIRECTORY_SIZE = "200GB"
 COHORT_PARQUET = DATA_INTERIM / "step1_cohort.parquet"
 STEP1_VALIDATION_JSON = DATA_INTERIM / "step1_validation.json"
 STEP1_CHART_ITEM_IDS = [

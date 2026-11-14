@@ -168,6 +168,7 @@ activemq-data/
 env/
 venv/
 ENV/
+capstone/
 env.bak/
 venv.bak/
 

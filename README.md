@@ -66,7 +66,27 @@ Download the required datasets separately from their providers and place them in
 * `data/raw/mimic_iv/` — Compressed MIMIC-IV tables under `hosp/` and `icu/`.
 * `data/raw/mimic_cxr/` — MIMIC-CXR metadata, CheXpert/NegBio labels, and frontal JPEG images.
 
-SapBERT runs locally for biomedical entity linking.
+SapBERT runs locally for biomedical entity linking. On the first run, Step 2
+downloads the pinned public model and tokenizer from Hugging Face if they are
+not cached. Later runs prefer the local cache. Set `SAPBERT_OFFLINE=1` to
+require cached files; a missing cache then produces an explicit error.
+`HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are also respected. Patient data
+is processed locally.
+
+Step 2 automatically uses CUDA when available and otherwise uses CPU. Set
+`SAPBERT_DEVICE=cpu` to force CPU execution. Embedding caches remain CPU tensors
+for portability. Current resource defaults target the 32-CPU, 115-GiB RAM host:
+16 DuckDB threads, a 64-GB DuckDB memory limit, up to 200 GB of temporary disk,
+and 8 SapBERT CPU threads. These limits do not reserve resources or cap total
+Python process memory.
+
+To run Steps 1–4 on the full eligible cohort, activate the project environment
+and run `./run_full_pipeline.sh`. Outputs and logs go to
+`data/interim/full_cohort/`; existing full-run outputs are overwritten. The
+script requires actual cohort CXR JPEGs, checks tokenization, and stops on errors.
+Pass `data/interim/full_cohort/tokenized_dataset` explicitly to Step 5 rather
+than using its default dataset path. Set `PYTHON=./capstone/bin/python` if you
+want to select the project environment without activating it.
 
 Step 3 retrieves clinical PrimeKG context independently for each of the four
 observation windows. Native directed relations are preserved, including

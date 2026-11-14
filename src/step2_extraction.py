@@ -126,12 +126,40 @@ def load_clinical_nodes():
     return nodes.to_dict("records")
 
 
+def load_sapbert_component(loader):
+    """Prefer cached pinned public weights; download on a first online run."""
+    kwargs = {"revision": config.SAPBERT_MODEL_REVISION}
+    try:
+        return loader.from_pretrained(config.SAPBERT_MODEL_NAME, local_files_only=True, **kwargs)
+    except OSError as exc:
+        if config.SAPBERT_OFFLINE:
+            logger.error("SapBERT cache is incomplete in offline mode. Run once with "
+                         "SAPBERT_OFFLINE=0 and Hugging Face offline flags disabled to download "
+                         "the pinned public model, then retry offline.")
+            raise RuntimeError("SapBERT is not cached for offline execution") from exc
+        logger.info("Downloading missing pinned public SapBERT files to the Hugging Face cache")
+        return loader.from_pretrained(config.SAPBERT_MODEL_NAME, local_files_only=False, **kwargs)
+
+
+def sapbert_device():
+    """Select CUDA automatically, retaining an explicit CPU option."""
+    requested = config.SAPBERT_DEVICE
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested for SapBERT but unavailable; use SAPBERT_DEVICE=cpu")
+    return device
+
+
 def embed_terms(terms, tokenizer, model):
     """Encode public vocabulary with normalized CLS vectors from pinned local SapBERT."""
+    device = next(model.parameters()).device
     batches = []
     for start in range(0, len(terms), config.SAPBERT_BATCH_SIZE):
         inputs = tokenizer(terms[start:start + config.SAPBERT_BATCH_SIZE], padding=True,
                            truncation=True, max_length=config.SAPBERT_MAX_LENGTH, return_tensors="pt")
+        inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
         with torch.inference_mode():
             vectors = model(**inputs).last_hidden_state[:, 0, :]
             batches.append(torch.nn.functional.normalize(vectors, p=2, dim=1).cpu())
@@ -188,10 +216,10 @@ def build_mappings():
         if cached.get("signature") == mapping_signature:
             logger.info("Using cached public finding mappings")
             return cached
-    tokenizer = AutoTokenizer.from_pretrained(config.SAPBERT_MODEL_NAME,
-        revision=config.SAPBERT_MODEL_REVISION, local_files_only=True)
-    model = AutoModel.from_pretrained(config.SAPBERT_MODEL_NAME,
-        revision=config.SAPBERT_MODEL_REVISION, local_files_only=True).eval()
+    device = sapbert_device()
+    logger.info("SapBERT embedding device: %s", device)
+    tokenizer = load_sapbert_component(AutoTokenizer)
+    model = load_sapbert_component(AutoModel).to(device).eval()
     cached = None
     if config.PRIMEKG_CLINICAL_EMBEDDINGS.is_file():
         cached = torch.load(config.PRIMEKG_CLINICAL_EMBEDDINGS, map_location="cpu", weights_only=True)
