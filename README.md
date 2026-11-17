@@ -40,7 +40,7 @@ the same observations and images while changing graph context:
 | Variant | Inputs and graph treatment |
 | --- | --- |
 | Temporal-RAG (`trag`) | Window-specific findings, images, and separately retrieved graphs. |
-| Static-RAG (`static_rag`) | The window graphs are merged, and the shared graph is rendered in each window. |
+| Static-RAG (`static_rag`) | The window graphs are merged, and the bounded shared graph is stored once for all four windows. |
 | No-KG (`no_kg`) | The same clinical observations and images, with graph triples omitted. |
 | XGBoost (`xgboost`) | A baseline trained on structured measurements. |
 
@@ -234,3 +234,5 @@ rejected. Add `--rationales` to save generated test rationales locally.
 ```bash
 python -m pytest tests/ -q
 ```
+
+Compact KG serialization preserves the existing displayed edge evidence. Full-cohort checks reduced 8K overflows to 200 temporal-RAG prompts and zero static-RAG/no-KG prompts. See [compact-context measurements](docs/experiments/compact-context-check.md) for the method, image settings, and remaining limits.
