@@ -26,8 +26,8 @@ DATA_INTERIM = PROJECT_ROOT / "data" / "interim"
 DATA_INTERIM.mkdir(parents=True, exist_ok=True)
 
 # Experiment tracking
-WANDB_PROJECT = "sepsis-temporal-graph-rag"
-WANDB_ENTITY = "team-ark"
+WANDB_PROJECT = "mimic-sepsis-capstone"
+WANDB_ENTITY = "rishabh-bhattad-university-of-arizona"
 
 # PrimeKG exploration settings
 PRIMEKG_ALLOWED_NODE_TYPES = ["disease", "effect/phenotype"]

@@ -1,14 +1,38 @@
-# Multimodal Temporal Graph-RAG for Sepsis Detection
+# Multimodal Temporal Graph-RAG for Retrospective Sepsis Detection
 
-A multimodal research project combining ICU electronic health records, chest radiographs, and biomedical knowledge graphs to estimate sepsis probability from 24 hours of observations.
+**Estimating sepsis probability from 24-hour multimodal observations in a retrospective Sepsis-3 cohort.**
 
-The planned model output is a sepsis probability and a short, evidence-based clinical rationale.
+This research study combines ICU electronic health records, chest radiographs, and biomedical knowledge graphs from the 24 hours preceding a retrospectively selected assessment anchor (`t0`).
+
+The planned model output is a model-derived sepsis classification score and a short evidence summary. The score is not established as a calibrated clinical probability, and generated summaries require evidence-grounding review.
 
 ---
 
 ## Overview
 
-This project investigates whether preserving the temporal evolution of patient findings and retrieving window-specific biomedical knowledge from **PrimeKG** improves sepsis probability estimation compared with static or no knowledge-graph retrieval. It combines ICU vitals, laboratory measurements, and chest radiographs across four six-hour windows, supporting research toward early sepsis detection.
+This project investigates whether preserving the temporal evolution of patient findings and retrieving window-specific biomedical knowledge from **PrimeKG** improves sepsis probability estimation in a retrospective Sepsis-3 cohort compared with static or no knowledge-graph retrieval. ICU vitals, laboratory measurements, and available chest radiographs are represented across four consecutive six-hour windows.
+
+### Study scope and interpretation
+
+The observation interval is `[t0 - 24 hours, t0)`. Positive assessment anchors
+come from the MIT-LCP Sepsis-3 derivation; control anchors use suspected infection
+or the maximum eligible SOFA score, depending on the control cohort. Anchor and
+control selection use retrospective stay/admission information. The task has no
+specified future prediction horizon and does not establish how many hours before
+sepsis onset an alert could be issued.
+
+The primary research question is whether temporal KG retrieval improves
+sepsis probability estimation on held-out patients within this retrospectively
+constructed cohort. Patient-level training/validation/test separation supports that internal
+comparison; it does not establish prospective or external generalization.
+
+This study does not demonstrate a validated real-time early-warning system or
+readiness for clinical deployment. Before making prospective claims, the protocol
+would need prediction-time-available eligibility/anchors, an explicit future
+outcome horizon, and verification that every input was available at prediction
+time. An audit of event versus result/documentation availability timestamps
+remains outstanding. These limitations also need to accompany retrospective
+results; changing the wording does not resolve them.
 
 ### Datasets
 
@@ -163,3 +187,200 @@ were unchanged. Reports are local under `data/interim/step3_smoke/`.
 These are functional checks, not clinical performance or SapBERT mapping
 accuracy results. The Step 2 mapping cutoff remains provisional. Full-cohort
 Step 3 retrieval has not been run.
+
+## Step 5 training runner and experiment tracking
+
+Activate the project environment. Authenticate locally with `wandb login` before
+online runs; never put the API key in source, commands shared with others, or chat.
+Runs use entity `team-ark`, project `sepsis-temporal-graph-rag`, and group
+`step5-comparison` by default. The variant is recorded as the W&B job type,
+tag, and run configuration; automatic names also include model, context limit,
+and smoke/full mode. Override these using the corresponding CLI options.
+
+First check the CLI:
+
+```bash
+python src/step5_run_training.py --help
+```
+
+A smoke run uses up to ten subjects from each training/validation split and
+two optimizer steps, followed by validation. It is a wiring/memory check, not a
+representative performance estimate. It prefers image and no-image cases when
+available but is not a worst-case memory benchmark.
+
+```bash
+python src/step5_run_training.py --smoke \
+  --output checkpoints/trag_8b_8k_smoke \
+  --max-seq-length 8192 --wandb-mode online
+```
+
+The default context policy preserves complete saved prompt text and actual image
+tokens. If an example does not fit, training stops instead of silently dropping
+context. Increasing the limit does not guarantee every example fits. The runner
+reprocesses `prompt_text` and images rather than using Step 4's already budgeted
+token IDs. This cannot restore text removed before saving a dataset.
+`--allow-kg-reduction` explicitly enables the existing KG fitting policy;
+use that only as a deliberate experiment choice. The default remains 4096 unless
+`--max-seq-length` is specified. Neither 8K GPU fit nor real-model training has
+been verified by the runner's synthetic tests.
+
+After a successful smoke test and context/memory assessment, a full run is:
+
+```bash
+python src/step5_run_training.py --full \
+  --output checkpoints/trag_8b_8k_full \
+  --max-seq-length 8192 --wandb-mode online
+```
+
+The runner currently supports Qwen3-VL on one visible CUDA GPU, with NF4 QLoRA,
+BF16 when supported, batch size 1, gradient accumulation, gradient checkpointing,
+SDPA, and language-only adapters. Qwen3.5/3.8 are rejected until their hybrid
+adapter coverage is verified. An optional `--max-image-pixels` changes the image
+resolution ceiling and must be held constant across comparisons.
+
+Use `--variant static_rag` or `--variant no_kg` with an explicitly prepared
+matching `--dataset`. The runner does not build ablation datasets automatically.
+All variants must use the same cohort and patient splits.
+
+```bash
+python src/step5_run_training.py --variant xgboost --full \
+  --windows data/interim/full_cohort/patient_windows.parquet \
+  --output data/interim/step5_results/xgboost_run1 --wandb-mode online
+```
+
+XGBoost uses CPU and logs aggregate validation/count metrics. Neural runs log
+loss, validation loss, learning rate, gradient norm, epoch, runtime, and peak
+GPU memory. Neither path uploads patient records, prompts, images, predictions,
+source code, or checkpoint artifacts. W&B logging uses an allowlisted callback,
+not the default Trainer integration. `--wandb-mode offline` (default) stores
+tracking locally; `disabled` disables it.
+
+Checkpoints, the final adapter/processor, run configuration, and training summary
+stay under `--output`. Select a new output directory for each experiment.
+To resume use `--resume /path/to/checkpoint-N` with matching model/context
+settings; the checkpoint must include Trainer state. W&B starts a new tracking
+run for each invocation, including a resumed training invocation.
+The test split is not used during training or validation. Held-out prediction,
+comparison metrics, and evidence auditing remain separate Step 5 operations.
+
+## Shell launchers and stage boundaries
+
+Use `run_full_pipeline.sh` for preprocessing and `run_training.sh` for
+experiments. Both use `capstone/bin/python` automatically; set `PYTHON` to
+override the interpreter. Both change to the repository root, so relative paths
+are interpreted from there.
+
+Recommended first-time sequence:
+
+```bash
+# Stable, reusable cohort/findings/graph artifacts.
+./run_full_pipeline.sh --from 1 --to 3
+
+# Download images referenced by the cohort; enter your S3 prefix and region.
+./capstone/bin/python src/utils.py \
+  --input data/interim/full_cohort/patient_windows.parquet --all --workers 8
+
+# Model-specific serialization and tokenization.
+./run_full_pipeline.sh --from 4 --to 4
+```
+
+Steps 2–3 use CXR tables, not JPEGs, so image downloading can follow Step 3.
+For earlier image access, run `--from 1 --to 1`, download images, then
+`--from 2 --to 3`. Running the preprocessing launcher without options retains
+the original Steps 1–4 behavior; it stops before Step 4 if images are missing.
+Selected steps overwrite their artifacts and logs; prerequisites for skipped
+steps must already exist.
+
+When changing the tokenizer or serialization length, rerun only Step 4:
+
+```bash
+MAX_SEQ_LENGTH=8192 ./run_full_pipeline.sh --from 4 --to 4
+```
+
+This prepares an 8K dataset but does not establish GPU training fit. It also
+does not change the configured model or the training runner's length default.
+A model change may require training-code compatibility work as well.
+
+Authenticate once with `./capstone/bin/wandb login`. Then launch an experiment:
+
+```bash
+./run_training.sh --smoke --max-seq-length 8192 \
+  --output checkpoints/trag_8b_8k_smoke --wandb-mode online
+```
+
+The shell launcher checks W&B authentication before loading weights for online
+runs. Offline and disabled modes do not contact W&B during this preflight.
+Full training requires `--full`; the default is smoke mode. Every training
+argument is forwarded to the Python runner, including `--variant`, `--dataset`,
+`--resume`, and W&B naming/group options. Use `./run_training.sh --help`.
+Training never reruns preprocessing or downloads cohort images.
+
+## Master experiment suite
+
+`run_training.sh --suite` orchestrates dataset preparation, sequential training,
+held-out prediction, and aggregate comparison. It reuses Steps 1–3 and builds
+fresh raw prompt datasets directly from their artifacts. Model-specific
+processing happens in the training/prediction collator, so the suite does not
+reuse truncated Step 4 token IDs.
+
+Edit `VARIANTS=(trag static_rag no_kg)` near the top of `run_training.sh`,
+or select runs explicitly:
+
+```bash
+# Plan only: no data/model loading, file creation, or W&B requests.
+./run_training.sh --suite --output data/interim/step5_results/suite_8b_8k \
+  --variants trag static_rag no_kg --max-seq-length 8192 --dry-run
+
+# Smoke: ten subjects per split, two optimizer steps per neural variant.
+./run_training.sh --suite --output data/interim/step5_results/suite_8b_8k_smoke \
+  --variants trag static_rag no_kg --max-seq-length 8192 --wandb-mode online
+
+# Full experiment: use a new directory.
+./run_training.sh --suite --output data/interim/step5_results/suite_8b_8k_full \
+  --variants trag static_rag no_kg --max-seq-length 8192 --full --wandb-mode online
+```
+
+Smoke comparisons are integration checks, not research performance estimates.
+A smoke selection is not a worst-case GPU memory benchmark. The context limit
+must fit complete prompts including image tokens, or the suite stops;
+`--allow-kg-reduction` is an explicit experimental choice.
+
+The suite defaults to excluding XGBoost. Add `xgboost` to `--variants` to train
+it once. Since it uses structured measurements rather than Qwen, it need not
+be retrained when only the Qwen model changes. Reuse its predictions with:
+
+```bash
+./run_training.sh --suite --output data/interim/step5_results/new_suite \
+  --variants trag static_rag no_kg --full \
+  --xgboost-predictions /absolute/path/to/xgboost/predictions.parquet
+```
+
+Reused predictions must come from the same cohort and split definition; regenerate
+them if cohort construction, structured features, or baseline settings changed.
+The suite checks held-out stay/subject/label alignment, but cannot infer the
+training provenance of an arbitrary cached prediction file.
+
+Artifacts under the suite directory:
+
+- `datasets/VARIANT/`: identical cohorts with the chosen graph treatment.
+- `runs/VARIANT/`: local adapters, training metrics, and `predictions.parquet`.
+- `comparison/model_comparison.csv` and `comparison/step5_validation.json`:
+  metrics and subject-bootstrap intervals for the selected variants.
+- `suite_config.json`: selected settings and cohort/graph checksums.
+
+Each variant has a separate W&B run in one group, and the comparison has its
+own aggregate-only run. Failed stages stop the suite. Existing nonempty suite
+directories are rejected; individual training runs can still use the training
+runner's checkpoint-resume support. The suite itself does not resume automatically.
+
+Use `--rationales` to also save generated test rationales locally; otherwise
+only probabilities are produced. Reviewer-assisted evidence auditing remains a
+separate action because it needs annotations. The default threshold is 0.5 and
+is not tuned on test data. Test predictions are generated only after each
+variant finishes training and validation.
+
+`--model`, `--revision`, and `--max-image-pixels` are shared across selected
+neural variants. Pin a model revision for reproducible comparisons. The runner
+currently supports Qwen3-VL; Qwen3.5/3.8 still need model/adapter compatibility
+work before using the same orchestration. Model changes do not require rerunning
+Steps 1–3 if the cohort/retrieval policy is unchanged.

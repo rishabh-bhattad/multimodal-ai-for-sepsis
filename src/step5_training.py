@@ -1,5 +1,6 @@
 """Prepare QLoRA training batches and produce sepsis scores with evidence summaries."""
 
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
@@ -78,7 +79,7 @@ def apply_qlora_to_model(
     return peft_model
 
 
-def prepare_model_prompt(record, processor, max_prompt_tokens):
+def prepare_model_prompt(record, processor, max_prompt_tokens, allow_graph_reduction=True):
     """Decode aligned radiographs and fit the actual Qwen input, including visual tokens."""
     prompt = record["prompt_text"]
     parts = prompt.split("<image>")
@@ -112,6 +113,11 @@ def prepare_model_prompt(record, processor, max_prompt_tokens):
             raise ValueError("Processor did not produce visual inputs for every aligned radiograph")
         return result
 
+    if not allow_graph_reduction:
+        result = encode(prompt)
+        if result["input_ids"].shape[-1] > max_prompt_tokens:
+            raise ValueError("Complete prompt exceeds context limit; increase the limit or explicitly allow KG reduction")
+        return prompt, result
     return fit_graph_context(prompt, encode, max_prompt_tokens)
 
 
@@ -139,6 +145,7 @@ class MultimodalDataCollator:
         padding_side: str = "right",
         processor: Optional[Any] = None,
         max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
+        allow_graph_reduction: bool = True,
     ):
         if padding_side not in ("right", "left"):
             raise ValueError(f"padding_side must be 'right' or 'left', got {padding_side}")
@@ -147,6 +154,7 @@ class MultimodalDataCollator:
         self.padding_side = padding_side
         self.processor = processor
         self.max_seq_length = max_seq_length
+        self.allow_graph_reduction = allow_graph_reduction
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Collates and pads a list of sample feature dicts into batched tensors."""
@@ -237,7 +245,8 @@ class MultimodalDataCollator:
             if target not in config.STEP4_CLASS_LABELS.values():
                 raise ValueError("Expected a binary target completion")
             completion = positive if target == config.STEP4_TARGET_COMPLETION_POSITIVE else negative
-            _, prompt_inputs = prepare_model_prompt(feature, self.processor, budget)
+            _, prompt_inputs = prepare_model_prompt(feature, self.processor, budget,
+                                                          allow_graph_reduction=self.allow_graph_reduction)
             examples.append(append_completion(prompt_inputs, completion))
 
         batch = {}
@@ -306,6 +315,9 @@ def get_training_arguments(
     if run_name is not None:
         args_dict["run_name"] = run_name
 
+    if "warmup_ratio" not in inspect.signature(TrainingArguments).parameters:
+        # New Transformers versions accept a fractional warmup_steps instead.
+        args_dict["warmup_steps"] = args_dict.pop("warmup_ratio")
     args_dict.update(kwargs)
     return TrainingArguments(**args_dict)
 
@@ -451,13 +463,15 @@ def get_target_token_ids(tokenizer: Any) -> Tuple[List[int], List[int]]:
 
 
 @torch.inference_mode()
-def predict_sepsis(model, processor, record, max_seq_length=config.STEP4_MAX_SEQ_LENGTH):
+def predict_sepsis(model, processor, record, max_seq_length=config.STEP4_MAX_SEQ_LENGTH,
+                   generate_rationale=True, allow_graph_reduction=True):
     """Score both complete labels on the same observation prompt and generate a separate rationale."""
     model.eval()
     device = model.get_input_embeddings().weight.device
     targets = get_target_token_ids(processor.tokenizer)
     fitted_prompt, prompt_inputs = prepare_model_prompt(
         record, processor, max_seq_length - max(map(len, targets)),
+        allow_graph_reduction=allow_graph_reduction,
     )
     prompt_length = prompt_inputs["input_ids"].shape[-1]
     scores = []
@@ -469,6 +483,8 @@ def predict_sepsis(model, processor, record, max_seq_length=config.STEP4_MAX_SEQ
         log_probs = logits[:, prompt_length - 1 : -1].float().log_softmax(dim=-1)
         scores.append(log_probs.gather(-1, labels[:, prompt_length:, None]).sum().item())
     probability = compute_sepsis_probability(*scores)
+    if not generate_rationale:
+        return {"sepsis_probability": probability}
 
     if not fitted_prompt.endswith(config.STEP4_TARGET_TASK):
         raise ValueError("Expected the binary task instruction at the end of the prompt")
@@ -476,6 +492,7 @@ def predict_sepsis(model, processor, record, max_seq_length=config.STEP4_MAX_SEQ
     _, rationale_inputs = prepare_model_prompt(
         {**record, "prompt_text": rationale_prompt}, processor,
         max_seq_length - config.STEP5_RATIONALE_MAX_NEW_TOKENS,
+        allow_graph_reduction=allow_graph_reduction,
     )
     generated = model.generate(
         **{key: value.to(device) for key, value in rationale_inputs.items()},
