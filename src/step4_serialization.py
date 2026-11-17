@@ -89,7 +89,7 @@ def format_vitals_line(window: Dict[str, Any]) -> str:
     if not _is_valid_measurement(temp):
         temp = window.get("temp_mean")
     text = _format_measurements([
-        ("Heart Rate", window.get("heart_rate_mean"), None, " bpm"),
+        ("Heart Rate", window.get("hr_mean", window.get("heart_rate_mean")), None, " bpm"),
         ("MAP", window.get("map_latest"), None, " mmHg"),
         ("SpO2", window.get("spo2_mean"), None, "%"),
         ("Temp", temp, 1, " C"),

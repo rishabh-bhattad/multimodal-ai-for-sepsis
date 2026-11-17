@@ -228,6 +228,9 @@ def run(args):
         "learning_rate": config.STEP5_LEARNING_RATE, "batch_size": 1,
         "gradient_accumulation_steps": config.STEP5_GRADIENT_ACCUMULATION_STEPS,
         "gradient_checkpointing": True, "adapter_target_count": len(targets),
+        "checkpoint_selection": "lowest_validation_loss" if args.full else "final_smoke_adapter",
+        "checkpoint_steps": config.STEP5_CHECKPOINT_STEPS if args.full else None,
+        "probability_calibration": "none",
         "trainable_parameters": trainable, "total_parameters": total,
         "trainable_percent": percent, "gpu": torch.cuda.get_device_name(0),
     }
@@ -236,6 +239,8 @@ def run(args):
     try:
         tracking = start_tracking(args, settings)
 
+        full_run = args.full
+
         class AggregateCallback(TrainerCallback):
             def on_log(self, args, state, control, logs=None, **kwargs):
                 if tracking:
@@ -243,13 +248,35 @@ def run(args):
                     if payload:
                         tracking.log(payload, step=state.global_step)
 
+            def on_step_end(self, args, state, control, **kwargs):
+                if full_run and state.global_step == state.max_steps:
+                    control.should_evaluate = True
+                    control.should_save = True
+                return control
+
+            def on_epoch_end(self, args, state, control, **kwargs):
+                if full_run:
+                    control.should_evaluate = True
+                    control.should_save = True
+                return control
+
+            def on_evaluate(self, args, state, control, **kwargs):
+                # Evaluation is complete; release unused allocator blocks before training resumes.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return control
+
         training_args = get_training_arguments(
             output_dir=args.output, run_name=args.run_name, num_train_epochs=args.epochs,
             per_device_train_batch_size=1, per_device_eval_batch_size=1,
             max_steps=max_steps, report_to="none", prediction_loss_only=True,
             gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
-            eval_strategy="epoch" if args.full else "no",
-            save_strategy="epoch" if args.full else "no", save_total_limit=2,
+            eval_strategy="steps" if args.full else "no",
+            save_strategy="steps" if args.full else "no", save_total_limit=3,
+            eval_steps=config.STEP5_CHECKPOINT_STEPS,
+            save_steps=config.STEP5_CHECKPOINT_STEPS,
+            load_best_model_at_end=args.full, metric_for_best_model="eval_loss",
+            greater_is_better=False, torch_empty_cache_steps=10,
             logging_steps=config.STEP5_LOGGING_STEPS if args.full else 1,
             bf16=dtype == torch.bfloat16, fp16=dtype == torch.float16,
             dataloader_num_workers=0, seed=config.RANDOM_SEED,
@@ -269,6 +296,7 @@ def run(args):
         trainer.save_model(str(args.output / "adapter"))
         trainer.save_state()
         metrics = {**scalar_metrics(result.metrics), **scalar_metrics(validation),
+                   "best_validation_loss": trainer.state.best_metric if args.full else None,
                    "peak_gpu_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
                    "peak_gpu_reserved_gib": torch.cuda.max_memory_reserved() / 2**30}
         (args.output / "training_summary.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -288,8 +316,15 @@ def run(args):
                 })
             pd.DataFrame(rows).to_parquet(args.output / "predictions.parquet", index=False)
             print(f"Saved {len(rows)} held-out predictions locally.")
+        selection = {
+            "policy": "lowest_validation_loss" if args.full else "final_smoke_adapter",
+            "best_model_checkpoint": trainer.state.best_model_checkpoint if args.full else None,
+            "best_validation_loss": trainer.state.best_metric if args.full else None,
+            "calibration": "none",
+        }
+        (args.output / "checkpoint_selection.json").write_text(json.dumps(selection, indent=2) + "\n")
         if tracking:
-            tracking.log(metrics)
+            tracking.log({key: value for key, value in metrics.items() if value is not None})
         print(json.dumps({"status": "complete", **metrics}, indent=2))
     finally:
         if tracking:
@@ -301,7 +336,13 @@ def main(argv=None):
     try:
         run(args)
     except Exception as exc:
-        # Model/processor/parser errors can contain record contents; don't print raw exceptions.
+        # Detailed errors stay local; never forward them to W&B or terminal output.
+        import traceback
+        try:
+            args.output.mkdir(parents=True, exist_ok=True)
+            (args.output / "error.log").write_text(traceback.format_exc())
+        except OSError:
+            pass
         print(f"Training failed ({type(exc).__name__}); inspect locally without uploading patient records.", file=sys.stderr)
         return 1
     return 0

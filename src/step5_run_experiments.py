@@ -1,5 +1,6 @@
 """Prepare, train, predict, and compare selected variants sequentially."""
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,7 @@ def parser():
     p.add_argument("--wandb-group", help="Default: suite output directory name")
     p.add_argument("--xgboost-predictions", type=Path, help="Reuse existing XGBoost predictions instead of retraining")
     p.add_argument("--resamples", type=int, default=1000)
+    p.add_argument("--continue-on-error", action="store_true", help="Attempt remaining independent variants after a failure; report partial completion")
     p.add_argument("--dry-run", action="store_true", help="Show plan without reading data, writing files, or training")
     return p
 
@@ -179,8 +181,21 @@ def main(argv=None):
         raise ValueError("Choose a new, empty suite output directory")
     os.chdir(ROOT)
     args.output.mkdir(parents=True, exist_ok=True)
-    destinations, reference, digests = prepare_variants(
-        args.windows, args.trajectories, args.variants, args.output, args.full)
+    completed = []
+    failed = []
+    def status(stage, variant=None, error_type=None):
+        payload = {"stage": stage, "variant": variant, "completed_variants": list(completed), "failed_variants": list(failed),
+                   "updated_utc": datetime.now(timezone.utc).isoformat(), "error_type": error_type}
+        pending = args.output / "status.json.tmp"
+        pending.write_text(json.dumps(payload, indent=2) + "\n")
+        pending.replace(args.output / "status.json")
+    status("preparing_datasets")
+    try:
+        destinations, reference, digests = prepare_variants(
+            args.windows, args.trajectories, args.variants, args.output, args.full)
+    except Exception as exc:
+        status("failed", error_type=type(exc).__name__)
+        raise
     manifest = {**plan, **digests}
     (args.output / "suite_config.json").write_text(json.dumps(manifest, indent=2) + "\n")
     prediction_files = {}
@@ -188,14 +203,39 @@ def main(argv=None):
         if variant == "xgboost" and args.xgboost_predictions:
             prediction_files[variant] = args.xgboost_predictions
             continue
-        subprocess.run(training_command(args, variant, destinations.get(variant)),
-                       check=True, env={**os.environ, "PYTHON": sys.executable})
+        status("training_and_prediction", variant)
+        log_dir = args.output / "logs"
+        log_dir.mkdir(exist_ok=True)
+        print(f"Starting {variant}; progress log: {log_dir / (variant + '.log')}", flush=True)
+        try:
+            with (log_dir / (variant + ".log")).open("w") as log:
+                subprocess.run(training_command(args, variant, destinations.get(variant)),
+                               check=True, env={**os.environ, "PYTHON": sys.executable},
+                               stdout=log, stderr=subprocess.STDOUT)
+        except Exception as exc:
+            failed.append(variant)
+            status("variant_failed", variant, type(exc).__name__)
+            if args.continue_on_error:
+                print(f"{variant} failed; see its local log. Attempting remaining selected variants.", flush=True)
+                continue
+            status("failed", variant, type(exc).__name__)
+            raise
+        completed.append(variant)
         prediction_files[variant] = args.output / "runs" / variant / "predictions.parquet"
     if args.xgboost_predictions:
         prediction_files["xgboost"] = args.xgboost_predictions
-    report = compare(args, prediction_files, reference)
-    print(f"Suite complete: {len(report['models'])} variants. Comparison: {args.output / 'comparison'}")
-    return 0
+    if not prediction_files:
+        status("failed", error_type="NoCompletedVariants")
+        return 1
+    status("comparing")
+    try:
+        report = compare(args, prediction_files, reference)
+    except Exception as exc:
+        status("failed", error_type=type(exc).__name__)
+        raise
+    status("partial_completion" if failed else "completed")
+    print(f"Suite finished: {len(report['models'])} completed variants; failed variants: {failed}. Comparison: {args.output / 'comparison'}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

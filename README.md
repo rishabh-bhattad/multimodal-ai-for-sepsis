@@ -45,6 +45,8 @@ the same observations and images while changing graph context:
 | XGBoost (`xgboost`) | A baseline trained on structured measurements. |
 
 Neural training uses Qwen3-VL with NF4 QLoRA and language-layer adapters.
+The final adapter is selected by the lowest validation loss. Model-derived
+sepsis scores are not calibrated clinical risk estimates.
 Evaluation reports AUROC, AUPRC (average precision), Brier score, sensitivity,
 and specificity, with subject-level bootstrap confidence intervals. Test
 predictions follow training and validation; the classification threshold is

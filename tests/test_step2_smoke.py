@@ -159,3 +159,116 @@ def test_primekg_quoted_names_after_sniff_sample(tmp_path, monkeypatch):
 if __name__ == "__main__":
     test_study_id_extraction()
     print("[SUCCESS] Study ID extraction smoke test passed.")
+
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+import config
+from src import step2_extraction as step2
+
+
+def test_cached_model_needs_no_download(monkeypatch):
+    monkeypatch.setattr(config, "SAPBERT_OFFLINE", False)
+    loader = Mock()
+    assert step2.load_sapbert_component(loader) is loader.from_pretrained.return_value
+    assert loader.from_pretrained.call_count == 1
+    assert loader.from_pretrained.call_args.kwargs["local_files_only"] is True
+
+
+def test_first_run_downloads_pinned_revision(monkeypatch):
+    monkeypatch.setattr(config, "SAPBERT_OFFLINE", False)
+    loader = Mock()
+    loader.from_pretrained.side_effect = [OSError("missing cache"), "downloaded"]
+    assert step2.load_sapbert_component(loader) == "downloaded"
+    assert [c.kwargs["local_files_only"] for c in loader.from_pretrained.call_args_list] == [True, False]
+    assert all(c.kwargs["revision"] == config.SAPBERT_MODEL_REVISION
+               for c in loader.from_pretrained.call_args_list)
+
+
+def test_offline_cache_miss_never_downloads(monkeypatch):
+    monkeypatch.setattr(config, "SAPBERT_OFFLINE", True)
+    loader = Mock()
+    loader.from_pretrained.side_effect = OSError("missing cache")
+    with pytest.raises(RuntimeError, match="not cached"):
+        step2.load_sapbert_component(loader)
+    assert loader.from_pretrained.call_count == 1
+
+
+def test_auto_device_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(config, "SAPBERT_DEVICE", "auto")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert step2.sapbert_device().type == "cpu"
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_embeddings_run_on_model_device_and_return_cpu(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(4, 3)
+        def forward(self, input_ids):
+            assert input_ids.device == self.embedding.weight.device
+            return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+    model = Encoder().to(device).eval()
+    tokenizer = lambda terms, **kwargs: {"input_ids": torch.ones((len(terms), 2), dtype=torch.long)}
+    vectors = step2.embed_terms(["a", "b"], tokenizer, model)
+    assert vectors.device.type == "cpu"
+    assert vectors.shape == (2, 3)
+    assert torch.allclose(vectors.norm(dim=1), torch.ones(2))
+
+
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import config
+from src.step2_extraction import rank_matches, resolve_mappings
+
+
+def test_cosine_ranking_preserves_node_identity():
+    nodes = [{'node_type': 'effect/phenotype', 'node_id': str(i), 'node_name': f'Finding {i}'} for i in range(3)]
+    candidates = rank_matches(['Observation'], torch.tensor([[1., 0.]]), nodes,
+                              torch.tensor([[0., 1.], [1., 0.], [-1., 0.]]))
+    assert candidates['Observation'][0]['node']['node_id'] == '1'
+    assert [match['similarity'] for match in candidates['Observation']] == [1., 0., -1.]
+
+
+@pytest.mark.parametrize('score,status', [(0.699, 'unresolved'), (0.70, 'matched'), (0.71, 'matched')])
+def test_provisional_cutoff_is_applied_consistently(monkeypatch, score, status):
+    monkeypatch.setattr(config, 'SAPBERT_SIMILARITY_THRESHOLD', 0.70)
+    candidates = {'Observation': [{'node': {'node_id': '1'}, 'similarity': score}]}
+    match = resolve_mappings(['Observation'], candidates)['Observation']
+    assert match['mapping_status'] == status
+    assert (match['node'] is not None) == (status == 'matched')
+
+
+def test_direct_mapping_does_not_substitute_another_query():
+    candidates = {
+        'Pyrexia': [{'node': {'node_id': '1'}, 'similarity': 0.60}],
+        'Fever': [{'node': {'node_id': '2'}, 'similarity': 0.85}],
+    }
+    result = resolve_mappings(['Pyrexia'], candidates)
+    assert result['Pyrexia']['node'] is None
+    assert result['Pyrexia']['mapping_status'] == 'unresolved'
+    assert result['Pyrexia']['matched_query'] == 'Pyrexia'
+    assert result['Pyrexia']['similarity'] == 0.60
+
+
+def test_cxr_edema_uses_pulmonary_query_but_preserves_original_label():
+    candidates = {
+        'Edema': [{'node': {'node_id': 'general', 'node_name': 'Edema'}, 'similarity': 1.0}],
+        'Pulmonary edema': [{'node': {'node_id': 'pulmonary', 'node_name': 'Pulmonary edema'}, 'similarity': 0.99}],
+    }
+    mappings = resolve_mappings(['Edema'], candidates)
+    assert set(mappings) == {'Edema'}
+    assert mappings['Edema']['matched_query'] == 'Pulmonary edema'
+    assert mappings['Edema']['node']['node_id'] == 'pulmonary'

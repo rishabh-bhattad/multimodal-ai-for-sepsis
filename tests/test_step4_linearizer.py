@@ -166,3 +166,8 @@ def test_serialize_window_block():
     assert lines[4] == "- Retrieved KG Prior:"
     assert lines[5] == "  [Consolidation] -> disease_disease -> [Pneumonia]"
 
+
+
+def test_heart_rate_uses_step1_canonical_column():
+    assert "Heart Rate 91 bpm" in format_vitals_line({"hr_mean":91., "heart_rate_mean":12.})
+    assert "Heart Rate" not in format_vitals_line({"hr_mean":float("nan")})

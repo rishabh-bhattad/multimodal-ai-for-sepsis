@@ -505,9 +505,11 @@ def main(argv=None):
     parser.add_argument("--primekg", type=Path, default=config.PRIMEKG_CSV)
     parser.add_argument("--output", type=Path, default=config.SUBGRAPH_TRAJECTORIES_PKL)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--sample_size", type=int, default=config.STEP3_SAMPLE_SIZE)
+    mode.add_argument("--sample_size", type=int, default=None)
     mode.add_argument("--full", action="store_true")
     args = parser.parse_args(argv)
+    if args.sample_size is None:
+        args.sample_size = config.STEP3_SAMPLE_SIZE
     if not args.full and args.sample_size < 1:
         parser.error("--sample_size must be positive")
     if args.output.suffix.lower() != ".pkl":
