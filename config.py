@@ -50,7 +50,8 @@ STEP3_SAMPLE_SIZE = 10
 TOKENIZED_DATASET_DIR = DATA_INTERIM / "tokenized_dataset"
 STEP4_VALIDATION_JSON = DATA_INTERIM / "step4_validation.json"
 STEP4_SAMPLE_SIZE = 10
-STEP4_MAX_SEQ_LENGTH = 4096
+# Maximum tokens per example; strict training rejects prompts above this limit.
+STEP4_MAX_SEQ_LENGTH = 8192
 
 STEP4_TARGET_COMPLETION_POSITIVE = "Sepsis"
 STEP4_TARGET_COMPLETION_NEGATIVE = "Non-Sepsis"
