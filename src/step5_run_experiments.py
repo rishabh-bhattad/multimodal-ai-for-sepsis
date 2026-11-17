@@ -165,7 +165,7 @@ def main(argv=None):
         if value is not None:
             setattr(args, name, value.resolve())
     args.wandb_group = args.wandb_group or args.output.name
-    plan = {"variants": args.variants, "mode": "full" if args.full else "smoke",
+    plan = {"kg_serialization": config.STEP4_KG_FORMAT, "variants": args.variants, "mode": "full" if args.full else "smoke",
             "model": args.model, "max_seq_length": args.max_seq_length,
             "xgboost_reused": bool(args.xgboost_predictions),
             "output": str(args.output), "wandb_mode": args.wandb_mode,

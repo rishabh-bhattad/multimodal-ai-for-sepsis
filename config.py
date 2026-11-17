@@ -52,6 +52,8 @@ STEP4_VALIDATION_JSON = DATA_INTERIM / "step4_validation.json"
 STEP4_SAMPLE_SIZE = 10
 # Maximum tokens per example; strict training rejects prompts above this limit.
 STEP4_MAX_SEQ_LENGTH = 8192
+# Format only: retain the same bounded display triples and temporal membership.
+STEP4_KG_FORMAT = "compact"
 
 STEP4_TARGET_COMPLETION_POSITIVE = "Sepsis"
 STEP4_TARGET_COMPLETION_NEGATIVE = "Non-Sepsis"

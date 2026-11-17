@@ -211,6 +211,11 @@ def run(args):
     max_steps = args.max_steps if args.max_steps is not None else (-1 if args.full else 2)
     settings = {
         "variant": args.variant, "allow_kg_reduction": args.allow_kg_reduction,
+        "kg_serialization": sorted({
+            "compact_v1" if "- Compact KG dictionary v1:" in row["prompt_text"]
+            else "verbose" if "  [" in row["prompt_text"] else "no_edges"
+            for split in data.values() for row in split
+        }),
         "model": args.model, "model_revision": getattr(model_config, "_commit_hash", args.revision),
         "max_seq_length": args.max_seq_length, "max_image_pixels": args.max_image_pixels,
         "mode": "full" if args.full else "smoke", "max_steps": max_steps,

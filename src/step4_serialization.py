@@ -22,6 +22,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import config
+from src.compact_kg import DICTIONARY, WINDOW, STATIC, displayed_triples, encode_graphs, json_line
 
 logger = logging.getLogger("Step4-Serialization")
 
@@ -117,17 +118,7 @@ def serialize_subgraph_edges(
     if subgraph is None or subgraph.number_of_edges() == 0:
         return f"- Retrieved KG Prior: {config.STEP4_BASELINE_KG_TEXT}"
 
-    triples = set()
-    for u, v, key, data in subgraph.edges(keys=True, data=True):
-        u_node = subgraph.nodes.get(u, {})
-        v_node = subgraph.nodes.get(v, {})
-        source_name = u_node.get("node_name") or (u[1] if isinstance(u, tuple) else str(u))
-        target_name = v_node.get("node_name") or (v[1] if isinstance(v, tuple) else str(v))
-        relation = data.get("relation", key)
-        triples.add((str(source_name).strip(), str(relation).strip(), str(target_name).strip()))
-
-    sorted_triples = sorted(triples, key=lambda t: (t[0].lower(), t[1].lower(), t[2].lower()))
-    retained_triples = sorted_triples[:max_edges]
+    retained_triples = displayed_triples(subgraph, max_edges)
 
     lines = ["- Retrieved KG Prior:"]
     for src, rel, tgt in retained_triples:
@@ -180,6 +171,8 @@ def assemble_multimodal_prompt(
     cxr_dir: Optional[Union[str, Path]] = None,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
     include_graph: bool = True,
+    graph_mode: str = "temporal",
+    kg_format: Optional[str] = None,
 ) -> Tuple[str, List[str]]:
     """Build the 24-hour prompt and return image paths in placeholder order."""
     if len(stay_windows) != config.NUM_WINDOWS:
@@ -195,6 +188,26 @@ def assemble_multimodal_prompt(
                 f"Windows must have sequential indices 0..{config.NUM_WINDOWS - 1}. "
                 f"Expected index {expected_idx}, got {win_idx}"
             )
+
+    kg_format = config.STEP4_KG_FORMAT if kg_format is None else kg_format
+    if kg_format not in ("compact", "verbose") or graph_mode not in ("temporal", "static"):
+        raise ValueError("Unknown graph serialization format or mode")
+    compact = include_graph and kg_format == "compact"
+    triples = [displayed_triples((subgraphs or {}).get(f"window_{i}"), max_edges_per_window)
+               for i in range(config.NUM_WINDOWS)] if compact else []
+    dictionary, adjacency = encode_graphs(triples) if compact else ({}, [])
+    graph_sections = []
+    if compact and dictionary["entities"]:
+        graph_sections = [
+            "KG context only, not diagnoses. Dictionary indices are local to this stay. "
+            "Adjacency [source,relation,[targets]] means directed source-to-target edges. "
+            "Relation names retain negative associations. Window lists identify when context applies.",
+            DICTIONARY + "\n" + json_line(dictionary),
+        ]
+        if graph_mode == "static":
+            if any(group != triples[0] for group in triples[1:]):
+                raise ValueError("Static mode requires the same graph for each window")
+            graph_sections.append(STATIC + "\n" + json_line(adjacency[0]))
 
     window_blocks: List[str] = []
     image_paths: List[str] = []
@@ -218,12 +231,16 @@ def assemble_multimodal_prompt(
             subgraph=sg,
             image_line=image_line,
             max_edges=max_edges_per_window,
-            include_graph=include_graph,
+            include_graph=include_graph and not compact,
         )
+        if compact and graph_mode == "temporal":
+            block += ("\n" + WINDOW + "\n" + json_line(adjacency[idx])
+                      if triples[idx] else f"\n- Retrieved KG Prior: {config.STEP4_BASELINE_KG_TEXT}")
         window_blocks.append(block)
 
     prompt_sections = [
         config.STEP4_SYSTEM_CONTEXT,
+        *graph_sections,
         *window_blocks,
         config.STEP4_TARGET_TASK,
     ]
@@ -245,6 +262,13 @@ class ContextBudgetError(ValueError):
 
 def fit_graph_context(prompt_text, encode, max_prompt_tokens):
     """Reduce complete KG edge lists evenly while keeping all observation blocks and images."""
+    if DICTIONARY in prompt_text:
+        encoded = encode(prompt_text)
+        ids = encoded["input_ids"]
+        length = ids.shape[-1] if hasattr(ids, "shape") else len(ids)
+        if length > max_prompt_tokens:
+            raise ContextBudgetError("Complete compact KG prompt exceeds the token budget; no edges were removed")
+        return prompt_text, encoded
     blocks = prompt_text.split("\n\n")
     edge_header = "- Retrieved KG Prior:"
     cap = max((sum(line.startswith("  [") for line in block.splitlines())

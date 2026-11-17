@@ -40,13 +40,14 @@ def build_static_rag_prompt(
     cxr_dir: Optional[Union[str, Path]] = None,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> Tuple[str, List[str]]:
-    """Render the same merged graph in each window for the static RAG comparison."""
+    """Use the same bounded merged evidence globally across the four windows."""
     union_graph = merge_subgraphs(subgraphs)
     return assemble_multimodal_prompt(
         stay_windows,
         subgraphs={f"window_{index}": union_graph for index in range(config.NUM_WINDOWS)},
         cxr_dir=cxr_dir,
         max_edges_per_window=max_edges_per_window,
+        graph_mode="static",
     )
 
 

@@ -118,10 +118,13 @@ def test_build_static_rag_prompt(sample_stay_windows, sample_temporal_subgraphs)
         header = format_window_header(i)
         assert header in prompt_text
 
-    # In Static-RAG, the union triples should appear in each window's serialized block
-    # Check that triple from window 3 appears across the prompt
-    assert "[Septic Shock] -> causes -> [Organ Failure]" in prompt_text
-    assert "[Pneumonia] -> triggers -> [Sepsis]" in prompt_text
+    # The shared static graph is stored once and applies to every window.
+    from src.compact_kg import decode_prompt, STATIC
+    decoded = decode_prompt(prompt_text)
+    assert all(group == decoded[0] for group in decoded)
+    assert ("Septic Shock", "causes", "Organ Failure") in decoded[0]
+    assert ("Pneumonia", "triggers", "Sepsis") in decoded[0]
+    assert prompt_text.count(STATIC) == 1
 
 
 def test_build_static_rag_prompt_validations(sample_stay_windows):

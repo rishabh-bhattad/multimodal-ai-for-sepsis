@@ -191,7 +191,8 @@ def test_assemble_multimodal_prompt_with_subgraphs():
 
     prompt, image_paths = assemble_multimodal_prompt(windows, subgraphs=subgraphs)
     assert len(image_paths) == 1
-    assert "[Consolidation] -> disease_disease -> [Pneumonia]" in prompt
+    from src.compact_kg import decode_prompt
+    assert decode_prompt(prompt)[0] == [("Consolidation", "disease_disease", "Pneumonia")]
     # Windows 1..3 fallback to baseline
     assert prompt.count(config.STEP4_BASELINE_KG_TEXT) == 3
 
