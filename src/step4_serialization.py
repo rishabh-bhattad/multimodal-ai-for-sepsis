@@ -29,23 +29,7 @@ logger = logging.getLogger("Step4-Serialization")
 
 
 def get_target_completion(label: int) -> str:
-    """Return the canonical binary target completion string for a binary cohort label.
-
-    Parameters
-    ----------
-    label : int
-        Binary Sepsis-3 label (0 or 1).
-
-    Returns
-    -------
-    str
-        "Sepsis" for label 1, "Non-Sepsis" for label 0.
-
-    Raises
-    ------
-    ValueError
-        If label is not 0 or 1.
-    """
+    """Return the canonical binary target completion string for a binary cohort label."""
     if type(label) is not int or label not in (0, 1):
         raise ValueError(f"Label must be integer 0 or 1, got: {label} (type {type(label).__name__})")
     return config.STEP4_CLASS_LABELS[label]
@@ -55,28 +39,7 @@ def compute_sepsis_probability(
     logit_pos: float,
     logit_neg: float,
 ) -> float:
-    """Compute normalized sepsis probability from positive and negative class logits.
-
-    Uses numerically stable two-class softmax:
-        P(sepsis) = exp(z_pos - max_z) / (exp(z_pos - max_z) + exp(z_neg - max_z))
-
-    Parameters
-    ----------
-    logit_pos : float
-        Conditional logit or log-probability for the positive target completion ("Sepsis").
-    logit_neg : float
-        Conditional logit or log-probability for the negative target completion ("Non-Sepsis").
-
-    Returns
-    -------
-    float
-        Probability value strictly in [0.0, 1.0].
-
-    Raises
-    ------
-    ValueError
-        If logits are NaN or both are infinite with the same sign.
-    """
+    """Normalize the two class scores with a stable softmax."""
     if math.isnan(logit_pos) or math.isnan(logit_neg):
         raise ValueError("Logits must not be NaN")
     if math.isinf(logit_pos) and math.isinf(logit_neg):
@@ -99,21 +62,7 @@ def format_inference_output(
     probability: float,
     reasoning_chain: str,
 ) -> Dict[str, Any]:
-    """Format the two-field inference output dictionary.
-
-    Parameters
-    ----------
-    probability : float
-        Estimated sepsis probability between 0.0 and 1.0.
-    reasoning_chain : str
-        Evidence-based clinical rationale.
-
-    Returns
-    -------
-    dict
-        Structured output matching the inference contract:
-        {"sepsis_probability": float, "reasoning_chain": str}
-    """
+    """Format the two-field inference output dictionary."""
     if not (0.0 <= probability <= 1.0):
         raise ValueError(f"Sepsis probability must be in [0.0, 1.0], got {probability}")
     if not isinstance(reasoning_chain, str):
@@ -126,23 +75,7 @@ def format_inference_output(
 
 
 def validate_inference_output(output_payload: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Validate that an inference output payload strictly conforms to the two-field schema.
-
-    Parameters
-    ----------
-    output_payload : str or dict
-        Raw JSON string or parsed dictionary.
-
-    Returns
-    -------
-    dict
-        Validated inference output dictionary.
-
-    Raises
-    ------
-    ValueError
-        If schema is invalid, required fields are missing, or probability is out of bounds.
-    """
+    """Validate that an inference output payload strictly conforms to the two-field schema."""
     if isinstance(output_payload, str):
         try:
             data = json.loads(output_payload)
@@ -173,18 +106,7 @@ def validate_inference_output(output_payload: Union[str, Dict[str, Any]]) -> Dic
 
 
 def format_window_header(window_idx: int) -> str:
-    """Format the chronological window interval header.
-
-    Parameters
-    ----------
-    window_idx : int
-        Window index (0, 1, 2, or 3).
-
-    Returns
-    -------
-    str
-        Header string like '[TIMELINE: T - 24 hours to T - 18 hours]'.
-    """
+    """Format the chronological window interval header."""
     if type(window_idx) is not int or window_idx not in range(config.NUM_WINDOWS):
         raise ValueError(f"window_idx must be integer 0..{config.NUM_WINDOWS - 1}, got: {window_idx}")
     start_h = config.OBSERVATION_HOURS - window_idx * config.WINDOW_SIZE_HOURS
@@ -193,7 +115,7 @@ def format_window_header(window_idx: int) -> str:
 
 
 def _is_valid_measurement(val: Any) -> bool:
-    """Check if a measurement value is present, non-null, and non-NaN."""
+    """Check whether a measurement is present and finite enough to format."""
     if val is None:
         return False
     try:
@@ -246,18 +168,7 @@ def format_vitals_line(window: Dict[str, Any]) -> str:
 
 
 def format_labs_line(window: Dict[str, Any]) -> str:
-    """Format structured laboratory measurements for a 6-hour window.
-
-    Parameters
-    ----------
-    window : dict
-        Window dictionary with lab measurements.
-
-    Returns
-    -------
-    str
-        Formatted labs line, or explicit absence statement if none recorded.
-    """
+    """Format structured laboratory measurements for a 6-hour window."""
     parts: List[str] = []
 
     lac = window.get("lactate_latest")
@@ -289,25 +200,7 @@ def serialize_subgraph_edges(
     subgraph: Optional[nx.MultiDiGraph],
     max_edges: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> str:
-    """Serialize the edges of a window PrimeKG MultiDiGraph into natural language statements.
-
-    Follows the technical contract:
-        "[Entity A] -> [relation] -> [Entity B]"
-    Edges are deduplicated, sorted deterministically, and capped at max_edges.
-    If the subgraph has 0 edges or is None, returns the baseline physiological context string.
-
-    Parameters
-    ----------
-    subgraph : nx.MultiDiGraph or None
-        Isolated window subgraph from Step 3.
-    max_edges : int
-        Maximum number of edge statements to serialize.
-
-    Returns
-    -------
-    str
-        Serialized multi-line KG text.
-    """
+    """Serialize a bounded, deterministic list of native PrimeKG triples for the window."""
     if subgraph is None or subgraph.number_of_edges() == 0:
         return f"- Retrieved KG Prior: {config.STEP4_BASELINE_KG_TEXT}"
 
@@ -336,27 +229,7 @@ def serialize_window_block(
     image_line: Optional[str] = None,
     max_edges: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> str:
-    """Serialize a single 6-hour window into its chronological text block.
-
-    Parameters
-    ----------
-    window_idx : int
-        Window index (0, 1, 2, 3).
-    window_data : dict
-        Vitals, labs, and metadata for the window.
-    subgraph : nx.MultiDiGraph or None
-        Isolated PrimeKG subgraph retrieved for this window.
-    image_line : str or None
-        Formatted image line (e.g. "- Image: <image> Frontal Chest Radiograph acquired."
-        or "- Image: No chest radiograph acquired in this window.").
-    max_edges : int
-        Max edges to serialize for the knowledge graph.
-
-    Returns
-    -------
-    str
-        Complete serialized text block for this observation window.
-    """
+    """Serialize a single 6-hour window into its chronological text block."""
     header = format_window_header(window_idx)
     vitals = format_vitals_line(window_data)
     labs = format_labs_line(window_data)
@@ -369,20 +242,7 @@ def resolve_image_path(
     cxr_path: Optional[Any],
     cxr_dir: Optional[Union[str, Path]] = None,
 ) -> Optional[str]:
-    """Resolve an image path to a normalized string path.
-
-    Parameters
-    ----------
-    cxr_path : str, Path, or None
-        Relative or absolute path to a radiograph file.
-    cxr_dir : str or Path, optional
-        Base directory for relative CXR paths (defaults to config.MIMIC_CXR_DIR).
-
-    Returns
-    -------
-    str or None
-        Normalized path string, or None if cxr_path is missing/empty/NaN.
-    """
+    """Resolve an image path to a normalized string path."""
     if cxr_path is None:
         return None
     try:
@@ -409,42 +269,12 @@ def assemble_multimodal_prompt(
     cxr_dir: Optional[Union[str, Path]] = None,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> Tuple[str, List[str]]:
-    """Assemble a 24-hour multimodal prompt from four chronological observation windows.
-
-    Combines system context, four chronological 6-hour window text blocks with
-    aligned CXR image placeholders and serialized PrimeKG subgraphs, and the final
-    target task instructions.
-
-    Parameters
-    ----------
-    stay_windows : list of dict
-        List of four window records for a single stay, ordered window_idx 0 to 3.
-    subgraphs : dict of str -> nx.MultiDiGraph, optional
-        Retrieved subgraphs for this stay, keyed by 'window_0' .. 'window_3'.
-    cxr_dir : str or Path, optional
-        Base directory containing chest radiographs (defaults to config.MIMIC_CXR_DIR).
-    max_edges_per_window : int
-        Maximum PrimeKG edges to serialize per window.
-
-    Returns
-    -------
-    prompt_text : str
-        The complete multimodal prompt string containing <image> tags in chronological order.
-    image_paths : list of str
-        List of resolved image paths matching the exact order and count of <image> tags.
-
-    Raises
-    ------
-    ValueError
-        If stay_windows does not contain exactly four windows, if window indices are invalid
-        or out of order, or if the <image> placeholder count does not match len(image_paths).
-    """
+    """Build the 24-hour prompt and return image paths in placeholder order."""
     if len(stay_windows) != config.NUM_WINDOWS:
         raise ValueError(
             f"Expected exactly {config.NUM_WINDOWS} windows per stay, got: {len(stay_windows)}"
         )
 
-    # Sort and validate window continuity
     sorted_windows = sorted(stay_windows, key=lambda w: w.get("window_idx", -1))
     for expected_idx, win in enumerate(sorted_windows):
         win_idx = win.get("window_idx")
@@ -486,7 +316,6 @@ def assemble_multimodal_prompt(
     ]
     prompt_text = "\n\n".join(prompt_sections)
 
-    # Verify placeholder-to-path 1-to-1 contract
     placeholder_count = prompt_text.count("<image>")
     if placeholder_count != len(image_paths):
         raise ValueError(
@@ -497,73 +326,66 @@ def assemble_multimodal_prompt(
     return prompt_text, image_paths
 
 
+class ContextBudgetError(ValueError):
+    """The required observations exceed the available model context."""
+
+
+def fit_graph_context(prompt_text, encode, max_prompt_tokens):
+    """Reduce complete KG edge lists evenly while keeping all observation blocks and images."""
+    blocks = prompt_text.split("\n\n")
+    edge_header = "- Retrieved KG Prior:"
+    cap = max((sum(line.startswith("  [") for line in block.splitlines())
+               for block in blocks if edge_header in block), default=0)
+    while True:
+        encoded = encode(prompt_text)
+        ids = encoded["input_ids"]
+        length = ids.shape[-1] if hasattr(ids, "shape") else len(ids)
+        if length <= max_prompt_tokens:
+            return prompt_text, encoded
+        if not cap:
+            raise ContextBudgetError("Four windows do not fit after removing retrieved graph context")
+        cap //= 2
+        trimmed = []
+        for block in blocks:
+            observations, marker, graph = block.partition("\n" + edge_header + "\n")
+            if not marker:
+                trimmed.append(block)
+                continue
+            edges = graph.splitlines()[:cap]
+            kg_text = "\n".join([edge_header, *edges]) if edges else (
+                f"{edge_header} {config.STEP4_BASELINE_KG_TEXT}"
+            )
+            trimmed.append(f"{observations}\n{kg_text}")
+        prompt_text = "\n\n".join(trimmed)
+
+
 def tokenize_and_mask_labels(
     prompt_text: str,
     target_completion: str,
     tokenizer: Any,
     max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
 ) -> Dict[str, List[int]]:
-    """Tokenize a prompt and target completion with causal target-only loss masking.
+    """Check the text budget and supervise only the explicitly appended binary completion."""
+    def encode(text, *, special):
+        if callable(tokenizer):
+            return list(tokenizer(text, add_special_tokens=special)["input_ids"])
+        return list(tokenizer.encode(text))
 
-    All prompt and vision tokens are assigned a label of -100 so that causal language
-    modeling loss is computed exclusively on the target completion tokens.
-
-    Parameters
-    ----------
-    prompt_text : str
-        The serialized prompt text.
-    target_completion : str
-        The canonical binary target completion ("Sepsis" or "Non-Sepsis").
-    tokenizer : Any
-        Hugging Face tokenizer or callable with encode / call interface.
-    max_seq_length : int
-        Maximum allowed token sequence length. Truncates prompt from left if exceeded.
-
-    Returns
-    -------
-    dict
-        Dictionary with keys:
-        - "input_ids": list of int
-        - "attention_mask": list of int
-        - "labels": list of int (with -100 for prompt tokens, token IDs for target)
-    """
-    full_text = f"{prompt_text.rstrip()}\n{target_completion.strip()}"
-    prompt_clean = prompt_text.rstrip()
-
-    if hasattr(tokenizer, "__call__"):
-        full_enc = tokenizer(full_text, add_special_tokens=True)
-        full_ids = list(full_enc["input_ids"])
-        full_mask = list(full_enc.get("attention_mask", [1] * len(full_ids)))
-        prompt_enc = tokenizer(prompt_clean, add_special_tokens=True)
-        prompt_ids = list(prompt_enc["input_ids"])
-    elif hasattr(tokenizer, "encode"):
-        full_ids = list(tokenizer.encode(full_text))
-        full_mask = [1] * len(full_ids)
-        prompt_ids = list(tokenizer.encode(prompt_clean))
-    else:
-        raise TypeError(f"Tokenizer {type(tokenizer).__name__} does not have __call__ or encode")
-
-    prompt_len = min(len(prompt_ids), len(full_ids) - 1)
-    if prompt_len < 0:
-        prompt_len = 0
-
-    labels = [-100] * prompt_len + full_ids[prompt_len:]
-
-    # Truncate from the left if sequence exceeds max_seq_length, preserving target tokens
-    if len(full_ids) > max_seq_length:
-        excess = len(full_ids) - max_seq_length
-        full_ids = full_ids[excess:]
-        full_mask = full_mask[excess:]
-        labels = labels[excess:]
-
-    # Guard: Ensure at least one token is active in labels (not all -100)
-    if all(lbl == -100 for lbl in labels) and labels:
-        labels[-1] = full_ids[-1]
-
+    completion_ids = encode(target_completion, special=False)
+    if not completion_ids:
+        raise ValueError("Binary completion tokenizes to an empty sequence")
+    completion_budget = max(
+        len(encode(label, special=False)) for label in config.STEP4_CLASS_LABELS.values()
+    )
+    _, prompt = fit_graph_context(
+        prompt_text.rstrip(), lambda text: {"input_ids": encode(text, special=True)},
+        max_seq_length - completion_budget,
+    )
+    prompt_ids = prompt["input_ids"]
     return {
-        "input_ids": full_ids,
-        "attention_mask": full_mask,
-        "labels": labels,
+        "input_ids": prompt_ids + completion_ids,
+        "attention_mask": [1] * (len(prompt_ids) + len(completion_ids)),
+        "labels": [-100] * len(prompt_ids) + completion_ids,
     }
 
 
@@ -579,36 +401,7 @@ def build_stay_example(
     max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> Dict[str, Any]:
-    """Build a single serialized and optionally tokenized patient stay record.
-
-    Parameters
-    ----------
-    stay_id : int or str
-        ICU stay identifier.
-    subject_id : int or str
-        Patient subject identifier.
-    split : str
-        Data split ('train', 'val', or 'test').
-    stay_windows : list of dict
-        The four chronological 6-hour windows for this stay.
-    label : int
-        Binary Sepsis-3 label (0 or 1).
-    subgraphs : dict of str -> nx.MultiDiGraph, optional
-        Retrieved subgraphs for this stay.
-    tokenizer : Any, optional
-        Tokenizer for encoding and causal loss masking.
-    cxr_dir : str or Path, optional
-        Base directory containing chest radiographs.
-    max_seq_length : int
-        Maximum sequence length for tokenization.
-    max_edges_per_window : int
-        Maximum PrimeKG edges per window.
-
-    Returns
-    -------
-    dict
-        Dataset record matching the Hugging Face contract.
-    """
+    """Build a stay record with ordered image paths and optional text-only token checks."""
     target_completion = get_target_completion(label)
     prompt_text, image_paths = assemble_multimodal_prompt(
         stay_windows=stay_windows,
@@ -644,23 +437,7 @@ def build_stay_example(
 def build_huggingface_dataset(
     examples: List[Dict[str, Any]],
 ) -> Any:
-    """Build a Hugging Face DatasetDict partitioned by train, validation, and test splits.
-
-    Parameters
-    ----------
-    examples : list of dict
-        List of stay records with 'split' ('train', 'validation', 'test').
-
-    Returns
-    -------
-    datasets.DatasetDict
-        DatasetDict containing train, validation, and test Hugging Face Dataset objects.
-
-    Raises
-    ------
-    ValueError
-        If subject isolation is violated (same subject appears in multiple splits).
-    """
+    """Build a Hugging Face DatasetDict partitioned by train, validation, and test splits."""
     from datasets import Dataset, DatasetDict
 
     splits_data: Dict[str, List[Dict[str, Any]]] = {
@@ -681,12 +458,10 @@ def build_huggingface_dataset(
         if split_name not in splits_data:
             raise ValueError(f"Unknown split name: {raw_split}")
 
-        # Drop the redundant 'split' column from the row before dataset conversion
         row = {k: v for k, v in ex.items() if k != "split"}
         splits_data[split_name].append(row)
         subjects_by_split[split_name].add(ex["subject_id"])
 
-    # Enforce strict subject-level split isolation
     for s1, s2 in [("train", "validation"), ("train", "test"), ("validation", "test")]:
         overlap = subjects_by_split[s1].intersection(subjects_by_split[s2])
         if overlap:
@@ -974,6 +749,9 @@ def main(argv=None):
             max_edges_per_window=args.max_edges,
         )
         logger.info("Step 4 complete: %s", json.dumps(summary, sort_keys=True))
+    except ContextBudgetError as exc:
+        logger.error("Step 4 context budget exceeded: %s", exc)
+        return 1
     except Exception as exc:
         logger.error("Step 4 failed (%s); inspect locally using synthetic inputs", type(exc).__name__)
         return 1

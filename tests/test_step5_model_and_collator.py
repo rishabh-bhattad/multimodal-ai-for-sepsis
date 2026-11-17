@@ -3,7 +3,9 @@
 import pytest
 import torch
 import torch.nn as nn
+from PIL import Image
 from peft import PeftModel, TaskType
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import config
 from src.step5_training import (
@@ -12,6 +14,7 @@ from src.step5_training import (
     count_trainable_parameters,
     apply_qlora_to_model,
     MultimodalDataCollator,
+    predict_sepsis,
 )
 
 
@@ -178,20 +181,96 @@ def test_multimodal_data_collator_auxiliary_fields():
             "attention_mask": [1, 1],
             "labels": [-100, 10],
             "stay_id": 10001,
-            "image_paths": ["img1.jpg"],
         },
         {
             "input_ids": [3, 4],
             "attention_mask": [1, 1],
             "labels": [-100, 20],
             "stay_id": 10002,
-            "image_paths": ["img2.jpg", "img3.jpg"],
         },
     ]
 
     batch = collator(features)
     assert batch["stay_id"] == [10001, 10002]
-    assert batch["image_paths"] == [["img1.jpg"], ["img2.jpg", "img3.jpg"]]
+
+
+class SyntheticProcessor:
+    """Exercise the processor interface without weights, a tokenizer download, or real images."""
+
+    tokenizer = None
+    pad_token_id = 0
+
+    def __init__(self):
+        self.tokenizer = self
+
+    def encode(self, text, add_special_tokens=False):
+        return {"Sepsis": [2, 3], "Non-Sepsis": [2, 4]}[text]
+
+    def decode(self, ids, skip_special_tokens=True):
+        assert ids.tolist() == [7]
+        return "Observed findings warrant review."
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert not tokenize and add_generation_prompt
+        return "".join(part.get("text", "<vision>") for part in messages[0]["content"])
+
+    def __call__(self, *, text, images, return_tensors, add_special_tokens, truncation):
+        assert text[0].count("<vision>") == len(images or [])
+        assert return_tensors == "pt" and not truncation
+        ids = torch.tensor([[1, 1] + [6] * len(images or [])])
+        result = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+        if images:
+            assert all(image.mode == "RGB" for image in images)
+            result["pixel_values"] = torch.tensor([image.getpixel((0, 0)) for image in images])
+            result["image_grid_thw"] = torch.ones(len(images), 3, dtype=torch.long)
+            result["mm_token_type_ids"] = (ids == 6).long()
+        return result
+
+
+def test_processor_packs_ordered_images_and_masks_prompt(tmp_path):
+    images = []
+    for index, color in enumerate(("red", "blue")):
+        path = tmp_path / f"synthetic_{index}.png"
+        Image.new("RGB", (8, 8), color=color).save(path)
+        images.append(str(path))
+    records = [
+        {"prompt_text": "First <image> then <image>", "image_paths": images,
+         "target_completion": "Sepsis", "subject_id": 1},
+        {"prompt_text": "No image", "image_paths": [], "target_completion": "Non-Sepsis"},
+    ]
+    batch = MultimodalDataCollator(processor=SyntheticProcessor())(records)
+    assert batch["pixel_values"].tolist() == [[255, 0, 0], [0, 0, 255]]
+    assert batch["image_grid_thw"].shape == (2, 3)
+    assert batch["mm_token_type_ids"].tolist() == [[0, 0, 1, 1, 0, 0], [0] * 6]
+    assert batch["labels"].tolist() == [[-100] * 4 + [2, 3], [-100] * 2 + [2, 4, -100, -100]]
+    assert "image_paths" not in batch and "subject_id" not in batch
+    with pytest.raises(ValueError, match="processor is required"):
+        MultimodalDataCollator()(records)
+
+
+def test_prediction_uses_the_token_after_a_shared_label_prefix(monkeypatch):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = nn.Embedding(8, 2)
+
+        def get_input_embeddings(self):
+            return self.embeddings
+
+        def forward(self, input_ids, attention_mask):
+            logits = torch.zeros((*input_ids.shape, 8))
+            logits[..., 3] = (input_ids == 2) * 5
+            return CausalLMOutputWithPast(logits=logits)
+
+        def generate(self, input_ids, attention_mask, **kwargs):
+            return torch.cat((input_ids, input_ids.new_tensor([[7]])), dim=1)
+
+    monkeypatch.setattr(config, "STEP5_RATIONALE_MAX_NEW_TOKENS", 10)
+    output = predict_sepsis(Model(), SyntheticProcessor(), {
+        "prompt_text": f"Observations\n\n{config.STEP4_TARGET_TASK}", "image_paths": [],
+    }, max_seq_length=32)
+    assert output["sepsis_probability"] == pytest.approx(0.9933, abs=1e-4)
+    assert output["reasoning_chain"] == "Observed findings warrant review."
 
 
 def test_multimodal_data_collator_validations():

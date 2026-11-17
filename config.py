@@ -57,25 +57,20 @@ STEP4_TARGET_COMPLETION_NEGATIVE = "Non-Sepsis"
 STEP4_CLASS_LABELS = {0: "Non-Sepsis", 1: "Sepsis"}
 
 STEP4_SYSTEM_CONTEXT = (
-    "You are an expert ICU Clinical Decision Support AI. Analyze the patient's "
-    "chronological trajectory across the past 24 hours, integrating structured vitals, "
-    "laboratory shifts, chest radiographs, and retrieved biomedical knowledge graph pathways. "
-    "Estimate the probability of sepsis from the complete 24-hour trajectory. Provide a short "
-    "evidence summary distinguishing observations from retrieved context. Mention a possible "
-    "infection source only when supported, and state uncertainty."
+    "Review the four observation windows covering 24 hours. Use the recorded vitals, labs, "
+    "and chest radiographs. Treat retrieved biomedical associations as context."
 )
-
-STEP4_TARGET_TASK = (
-    "Evaluate the chronological evidence. Respond ONLY with a valid JSON object matching this schema:\n"
-    "{\n"
-    '  "sepsis_probability": <float between 0.0 and 1.0>,\n'
-    '  "reasoning_chain": "<short evidence-based clinical rationale; state uncertainty and distinguish observations from retrieved context>"\n'
-    "}"
+STEP4_TARGET_TASK = "Respond with exactly one label: Sepsis or Non-Sepsis."
+STEP5_RATIONALE_TASK = (
+    "Give a short clinical rationale for the sepsis assessment. Distinguish observed "
+    "evidence from retrieved context, state uncertainty, and mention a possible infection "
+    "source only when supported."
 )
+STEP5_RATIONALE_MAX_NEW_TOKENS = 160
 
 STEP4_IMAGE_PLACEHOLDER = "<image> Frontal Chest Radiograph acquired."
 STEP4_NO_IMAGE_PLACEHOLDER = "No chest radiograph acquired in this window."
-STEP4_BASELINE_KG_TEXT = "[Normal Physiological Baseline]."
+STEP4_BASELINE_KG_TEXT = "[No graph context retrieved.]"
 STEP4_NO_KG_TEXT = "[No biomedical knowledge graph pathways retrieved for this window.]"
 
 # MIMIC-IV item IDs for initial data inspection

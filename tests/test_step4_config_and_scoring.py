@@ -38,8 +38,8 @@ def test_config_step4_settings_exist_and_valid():
     assert config.STEP4_SAMPLE_SIZE == 10
     assert config.STEP4_MAX_SEQ_LENGTH > 0
     assert "<image>" in config.STEP4_IMAGE_PLACEHOLDER
-    assert "sepsis_probability" in config.STEP4_TARGET_TASK
-    assert "reasoning_chain" in config.STEP4_TARGET_TASK
+    assert all(label in config.STEP4_TARGET_TASK for label in config.STEP4_CLASS_LABELS.values())
+    assert "JSON" not in config.STEP4_TARGET_TASK
 
 
 def test_get_target_completion():

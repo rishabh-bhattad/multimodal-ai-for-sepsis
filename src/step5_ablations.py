@@ -1,11 +1,4 @@
-"""Step 5: Static-RAG and No-KG Prompt Baseline Transforms.
-
-Implements the data transformation pipelines for the two RAG ablation baselines:
-1. Static-RAG: All 4 windows' subgraphs collapsed into a single flat union graph
-   S_static = union(S_0, S_1, S_2, S_3) and serialized across windows.
-2. No-KG Prompt: Completely removes all PrimeKG graph triples while preserving
-   identical chronological vitals, labs, and CXR image alignments.
-"""
+"""Build static RAG and no-KG comparisons from the same observations and images."""
 
 import logging
 from pathlib import Path
@@ -29,17 +22,7 @@ logger = logging.getLogger("Step5-Ablations")
 
 
 def merge_subgraphs(subgraphs: Optional[Dict[str, nx.MultiDiGraph]]) -> nx.MultiDiGraph:
-    """Collapses multiple window subgraphs into a single merged graph.
-
-    Computes S_static = union_{i=0}^3 S_i. Preserves all node attributes and
-    unique multi-edges across all windows.
-
-    Args:
-        subgraphs: Dict mapping window keys (e.g. 'window_0'..'window_3') to subgraphs.
-
-    Returns:
-        Consolidated nx.MultiDiGraph containing all nodes and edges.
-    """
+    """Collapses multiple window subgraphs into a single merged graph."""
     merged = nx.MultiDiGraph()
     if not subgraphs:
         return merged
@@ -48,14 +31,12 @@ def merge_subgraphs(subgraphs: Optional[Dict[str, nx.MultiDiGraph]]) -> nx.Multi
         if sg is None or not isinstance(sg, (nx.Graph, nx.DiGraph, nx.MultiGraph, nx.MultiDiGraph)):
             continue
 
-        # Merge nodes with attributes
         for node, attrs in sg.nodes(data=True):
             if node not in merged:
                 merged.add_node(node, **attrs)
             else:
                 merged.nodes[node].update(attrs)
 
-        # Merge edges with attributes
         for u, v, data in sg.edges(data=True):
             merged.add_edge(u, v, **data)
 
@@ -68,20 +49,7 @@ def build_static_rag_prompt(
     cxr_dir: Optional[Union[str, Path]] = None,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> Tuple[str, List[str]]:
-    """Assembles a Static-RAG prompt where all 4 windows share the flat union graph.
-
-    Collapses window subgraphs into S_static = union(S_0, S_1, S_2, S_3) and serializes
-    the identical merged context across all four 6-hour windows.
-
-    Args:
-        stay_windows: List of four window records for a single stay, ordered 0 to 3.
-        subgraphs: Dict mapping 'window_0'..'window_3' to isolated subgraphs.
-        cxr_dir: Base directory for radiographs (defaults to config.MIMIC_CXR_DIR).
-        max_edges_per_window: Maximum edges serialized per window block.
-
-    Returns:
-        Tuple of (prompt_text, image_paths).
-    """
+    """Render the same merged graph in each window for the static RAG comparison."""
     if len(stay_windows) != config.NUM_WINDOWS:
         raise ValueError(
             f"Expected exactly {config.NUM_WINDOWS} windows per stay, got: {len(stay_windows)}"
@@ -96,7 +64,6 @@ def build_static_rag_prompt(
                 f"Expected index {expected_idx}, got {win_idx}"
             )
 
-    # Compute flat union graph
     union_graph = merge_subgraphs(subgraphs)
 
     window_blocks: List[str] = []
@@ -139,18 +106,7 @@ def build_no_kg_prompt(
     stay_windows: List[Dict[str, Any]],
     cxr_dir: Optional[Union[str, Path]] = None,
 ) -> Tuple[str, List[str]]:
-    """Assembles a No-KG prompt with all PrimeKG biomedical triples omitted.
-
-    Retains strictly chronological vitals, laboratory values, and aligned chest
-    radiographs to test the empirical value of external biomedical knowledge.
-
-    Args:
-        stay_windows: List of four window records for a single stay, ordered 0 to 3.
-        cxr_dir: Base directory for radiographs (defaults to config.MIMIC_CXR_DIR).
-
-    Returns:
-        Tuple of (prompt_text, image_paths).
-    """
+    """Assembles a No-KG prompt with all PrimeKG biomedical triples omitted."""
     if len(stay_windows) != config.NUM_WINDOWS:
         raise ValueError(
             f"Expected exactly {config.NUM_WINDOWS} windows per stay, got: {len(stay_windows)}"
@@ -180,7 +136,6 @@ def build_no_kg_prompt(
         header = format_window_header(idx)
         vitals = format_vitals_line(win)
         labs = format_labs_line(win)
-        # Note: Zero KG triples or headers emitted in No-KG prompt
         block = f"{header}\n{vitals}\n{labs}\n{image_line}"
         window_blocks.append(block)
 
@@ -209,21 +164,7 @@ def build_ablation_dataset_dict(
     cxr_dir: Optional[Union[str, Path]] = None,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
 ) -> DatasetDict:
-    """Builds a Hugging Face DatasetDict for the requested ablation variant.
-
-    Args:
-        stays_by_split: Dict mapping split name ('train', 'validation', 'test')
-            to lists of stay records. Each record must contain 'stay_id', 'subject_id',
-            'label', 'windows' (list of 4 window dicts), and optionally 'subgraphs'.
-        variant: Either 'static_rag' or 'no_kg'.
-        tokenizer: Optional tokenizer for tokenization and causal loss masking.
-        max_seq_length: Maximum allowed sequence length.
-        cxr_dir: Radiograph directory root.
-        max_edges_per_window: Maximum edges per window for Static-RAG.
-
-    Returns:
-        Configured DatasetDict instance.
-    """
+    """Build the comparison datasets from the same window records and binary target."""
     if variant not in ("static_rag", "no_kg"):
         raise ValueError(f"Unknown variant '{variant}'. Expected 'static_rag' or 'no_kg'.")
 

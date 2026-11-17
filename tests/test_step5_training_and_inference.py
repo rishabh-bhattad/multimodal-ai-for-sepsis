@@ -182,11 +182,11 @@ def test_extract_sepsis_probability_2d_and_3d():
 def test_get_target_token_ids():
     tokenizer = MockTokenizer({
         config.STEP4_TARGET_COMPLETION_POSITIVE: [101],
-        config.STEP4_TARGET_COMPLETION_NEGATIVE: [102],
+        config.STEP4_TARGET_COMPLETION_NEGATIVE: [102, 103],
     })
     pos_id, neg_id = get_target_token_ids(tokenizer)
-    assert pos_id == 101
-    assert neg_id == 102
+    assert pos_id == [101]
+    assert neg_id == [102, 103]
 
     # Empty token error
     broken_tokenizer = MockTokenizer({config.STEP4_TARGET_COMPLETION_POSITIVE: []})

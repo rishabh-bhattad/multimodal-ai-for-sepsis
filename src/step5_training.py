@@ -1,10 +1,4 @@
-"""Step 5: Model Training, QLoRA Configuration & Training Harness.
-
-Implements model quantization, PEFT LoRA adapter initialization, parameter
-counting, dynamic multimodal sequence collation, Hugging Face Trainer orchestration,
-adapter checkpointing/reload verification, conditional logit probability extraction,
-and two-field inference JSON generation for the vision-language backbone.
-"""
+"""Prepare QLoRA training batches and produce sepsis scores with evidence summaries."""
 
 import json
 from pathlib import Path
@@ -12,7 +6,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
-from transformers import BitsAndBytesConfig, Trainer, TrainingArguments
+from PIL import Image
+from transformers import AutoProcessor, BitsAndBytesConfig, Trainer, TrainingArguments
 from peft import (
     LoraConfig,
     TaskType,
@@ -22,6 +17,7 @@ from peft import (
 )
 
 import config
+from src.step4_serialization import compute_sepsis_probability, fit_graph_context
 
 
 def get_qlora_config(
@@ -32,19 +28,7 @@ def get_qlora_config(
     bias: str = config.STEP5_LORA_BIAS,
     task_type: TaskType = TaskType.CAUSAL_LM,
 ) -> LoraConfig:
-    """Builds and returns the PEFT LoRA configuration for causal language modeling.
-
-    Args:
-        r: LoRA attention dimension (rank).
-        lora_alpha: Alpha parameter for LoRA scaling.
-        lora_dropout: Dropout probability for LoRA layers.
-        target_modules: Names of module targets to apply LoRA.
-        bias: Bias type for LoRA ('none', 'all', or 'lora_only').
-        task_type: Task type, default CAUSAL_LM.
-
-    Returns:
-        Configured LoraConfig instance.
-    """
+    """Builds and returns the PEFT LoRA configuration for causal language modeling."""
     if target_modules is None:
         target_modules = list(config.STEP5_LORA_TARGET_MODULES)
     return LoraConfig(
@@ -63,17 +47,7 @@ def get_quantization_config(
     bnb_4bit_compute_dtype: Any = torch.bfloat16,
     bnb_4bit_use_double_quant: bool = True,
 ) -> BitsAndBytesConfig:
-    """Builds and returns the 4-bit BitsAndBytes quantization configuration (NF4).
-
-    Args:
-        load_in_4bit: Enable 4-bit quantization.
-        bnb_4bit_quant_type: Quantization data type ('nf4' or 'fp4').
-        bnb_4bit_compute_dtype: Compute dtype for linear layers (torch.bfloat16).
-        bnb_4bit_use_double_quant: Enable nested/double quantization.
-
-    Returns:
-        Configured BitsAndBytesConfig instance.
-    """
+    """Builds and returns the 4-bit BitsAndBytes quantization configuration (NF4)."""
     return BitsAndBytesConfig(
         load_in_4bit=bool(load_in_4bit),
         bnb_4bit_quant_type=bnb_4bit_quant_type,
@@ -83,14 +57,7 @@ def get_quantization_config(
 
 
 def count_trainable_parameters(model: nn.Module) -> Tuple[int, int, float]:
-    """Calculates trainable parameters, total parameters, and the percentage trainable.
-
-    Args:
-        model: PyTorch Module or PeftModel.
-
-    Returns:
-        Tuple of (trainable_params, all_params, percentage).
-    """
+    """Calculates trainable parameters, total parameters, and the percentage trainable."""
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_params = sum(p.numel() for p in model.parameters())
     percentage = 100.0 * trainable_params / all_params if all_params > 0 else 0.0
@@ -102,16 +69,7 @@ def apply_qlora_to_model(
     lora_config: Optional[LoraConfig] = None,
     prepare_for_kbit: bool = True,
 ) -> PeftModel:
-    """Wraps a base model with PEFT LoRA adapters for causal LM training.
-
-    Args:
-        model: Base PyTorch neural network.
-        lora_config: Optional LoraConfig. If None, uses default get_qlora_config().
-        prepare_for_kbit: Whether to call prepare_model_for_kbit_training if 4-bit loaded.
-
-    Returns:
-        Configured PeftModel instance.
-    """
+    """Wraps a base model with PEFT LoRA adapters for causal LM training."""
     if lora_config is None:
         lora_config = get_qlora_config()
 
@@ -122,40 +80,84 @@ def apply_qlora_to_model(
     return peft_model
 
 
-class MultimodalDataCollator:
-    """Dynamic padding data collator for multimodal causal sequence training.
+def prepare_model_prompt(record, processor, max_prompt_tokens):
+    """Decode aligned radiographs and fit the actual Qwen input, including visual tokens."""
+    prompt = record["prompt_text"]
+    parts = prompt.split("<image>")
+    paths = record["image_paths"]
+    if len(parts) != len(paths) + 1:
+        raise ValueError("Image placeholders and paths are not aligned")
+    images = []
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                images.append(image.convert("RGB"))
+        except (OSError, ValueError) as error:
+            raise ValueError("An aligned radiograph could not be decoded") from error
 
-    Applies right-padding (or left-padding) across input_ids, attention_mask,
-    and labels. Ensures target-only causal loss masking is preserved:
-    - input_ids padded with pad_token_id.
-    - attention_mask padded with 0.
-    - labels padded with label_pad_token_id (-100).
-    """
+    def encode(text):
+        content = []
+        for index, part in enumerate(text.split("<image>")):
+            if index:
+                content.append({"type": "image"})
+            if part:
+                content.append({"type": "text", "text": part})
+        rendered = processor.apply_chat_template(
+            [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True,
+        )
+        result = dict(processor(
+            text=[rendered], images=images or None, return_tensors="pt",
+            add_special_tokens=False, truncation=False,
+        ))
+        if images and ("pixel_values" not in result or "image_grid_thw" not in result
+                       or result["image_grid_thw"].shape[0] != len(images)):
+            raise ValueError("Processor did not produce visual inputs for every aligned radiograph")
+        return result
+
+    return fit_graph_context(prompt, encode, max_prompt_tokens)
+
+
+def append_completion(prompt_inputs, completion_ids):
+    """Append text tokens without altering the vision tensors or supervising the prompt."""
+    ids = prompt_inputs["input_ids"]
+    completion = ids.new_tensor([completion_ids])
+    example = {**prompt_inputs, "input_ids": torch.cat((ids, completion), dim=1)}
+    for key in ("attention_mask", "mm_token_type_ids", "token_type_ids"):
+        if key in example:
+            values = example[key]
+            fill = 1 if key == "attention_mask" else 0
+            example[key] = torch.cat((values, values.new_full(completion.shape, fill)), dim=1)
+    example["labels"] = torch.cat((torch.full_like(ids, -100), completion), dim=1)
+    return example
+
+
+class MultimodalDataCollator:
+    """Collate multimodal examples while preserving target-only loss masking."""
 
     def __init__(
         self,
         pad_token_id: int = 0,
         label_pad_token_id: int = -100,
         padding_side: str = "right",
+        processor: Optional[Any] = None,
+        max_seq_length: int = config.STEP4_MAX_SEQ_LENGTH,
     ):
         if padding_side not in ("right", "left"):
             raise ValueError(f"padding_side must be 'right' or 'left', got {padding_side}")
         self.pad_token_id = int(pad_token_id)
         self.label_pad_token_id = int(label_pad_token_id)
         self.padding_side = padding_side
+        self.processor = processor
+        self.max_seq_length = max_seq_length
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Collates and pads a list of sample feature dicts into batched tensors.
-
-        Args:
-            features: List of dicts, each containing 'input_ids', 'attention_mask', 'labels'.
-
-        Returns:
-            Dict containing 2D LongTensors for input_ids, attention_mask, labels,
-            plus any preserved non-token fields.
-        """
+        """Collates and pads a list of sample feature dicts into batched tensors."""
         if not features:
             raise ValueError("Cannot collate an empty list of features.")
+        if self.processor is not None:
+            return self._collate_model_inputs(features)
+        if any(feature.get("image_paths") for feature in features):
+            raise ValueError("A vision-language processor is required for image-bearing records")
 
         required_keys = ["input_ids", "attention_mask", "labels"]
         for key in required_keys:
@@ -213,7 +215,6 @@ class MultimodalDataCollator:
             "labels": padded_labels,
         }
 
-        # Retain auxiliary fields (e.g., stay_id, image_paths, metadata)
         for key in features[0]:
             if key in required_keys:
                 continue
@@ -226,6 +227,40 @@ class MultimodalDataCollator:
             else:
                 batch[key] = values
 
+        return batch
+
+    def _collate_model_inputs(self, features):
+        """Pad text tensors and concatenate image patches in sample and window order."""
+        positive, negative = get_target_token_ids(self.processor.tokenizer)
+        budget = self.max_seq_length - max(len(positive), len(negative))
+        examples = []
+        for feature in features:
+            target = feature["target_completion"]
+            if target not in config.STEP4_CLASS_LABELS.values():
+                raise ValueError("Expected a binary target completion")
+            completion = positive if target == config.STEP4_TARGET_COMPLETION_POSITIVE else negative
+            _, prompt_inputs = prepare_model_prompt(feature, self.processor, budget)
+            examples.append(append_completion(prompt_inputs, completion))
+
+        batch = {}
+        pad_values = {"input_ids": self.pad_token_id, "attention_mask": 0,
+                      "labels": self.label_pad_token_id, "mm_token_type_ids": 0, "token_type_ids": 0}
+        width = max(example["input_ids"].shape[-1] for example in examples)
+        for key, value in pad_values.items():
+            if not any(key in example for example in examples):
+                continue
+            sequences = []
+            for example in examples:
+                ids = example["input_ids"]
+                sequence = example.get(key, torch.zeros_like(ids))
+                padding = width - ids.shape[-1]
+                sides = (padding, 0) if self.padding_side == "left" else (0, padding)
+                sequences.append(torch.nn.functional.pad(sequence, sides, value=value))
+            batch[key] = torch.cat(sequences)
+        for key in ("pixel_values", "image_grid_thw"):
+            tensors = [example[key] for example in examples if key in example]
+            if tensors:
+                batch[key] = torch.cat(tensors)
         return batch
 
 
@@ -247,7 +282,7 @@ def get_training_arguments(
     fp16: Optional[bool] = None,
     **kwargs: Any,
 ) -> TrainingArguments:
-    """Builds Hugging Face TrainingArguments configured for Step 5 QLoRA fine-tuning."""
+    """Build the training arguments for the QLoRA run."""
     if bf16 is None:
         bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     if fp16 is None:
@@ -288,17 +323,22 @@ class SepsisTrainer(Trainer):
         train_dataset: Optional[Any] = None,
         eval_dataset: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
+        processor: Optional[Any] = None,
         **kwargs: Any,
     ):
         if data_collator is None:
-            data_collator = MultimodalDataCollator()
+            if processor is None:
+                processor = AutoProcessor.from_pretrained(config.BASE_LVLM_NAME, local_files_only=True)
+            data_collator = MultimodalDataCollator(
+                processor=processor, pad_token_id=processor.tokenizer.pad_token_id,
+            )
         super().__init__(
             model=model,
             args=args,
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
+            processing_class=processor if processor is not None else tokenizer,
             **kwargs,
         )
 
@@ -312,8 +352,8 @@ class SepsisTrainer(Trainer):
             self.model.save_pretrained(str(save_path))
         else:
             super().save_model(output_dir=output_dir, _internal_call=_internal_call)
-        if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
-            self.tokenizer.save_pretrained(str(save_path))
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(str(save_path))
 
 
 def save_adapter_checkpoint(
@@ -358,21 +398,7 @@ def extract_sepsis_probability(
     target_pos_idx: int = -1,
     is_sequence: bool = False,
 ) -> Union[float, List[float]]:
-    """Derives normalized sepsis probability P(sepsis) from conditional class logits.
-
-    P(sepsis) = exp(z_pos - max_z) / (exp(z_pos - max_z) + exp(z_neg - max_z))
-
-    Args:
-        logits: Model output logits tensor (1D, 2D, or 3D).
-        pos_token_id: Vocabulary ID for the positive token ('Sepsis').
-        neg_token_id: Vocabulary ID for the negative token ('Non-Sepsis').
-        target_pos_idx: Sequence index of target completion token (default -1).
-        is_sequence: If True and logits is 2D, treats dim 0 as sequence length.
-                     If False and logits is 2D, treats dim 0 as batch size.
-
-    Returns:
-        float if single sample, or List[float] if batched.
-    """
+    """Normalize scores for single-token labels; use sequence scoring for Qwen."""
     if not isinstance(logits, torch.Tensor):
         logits = torch.tensor(logits, dtype=torch.float32)
 
@@ -380,7 +406,7 @@ def extract_sepsis_probability(
         target_logits = logits[:, target_pos_idx, :]
     elif logits.ndim == 2:
         if is_sequence:
-            target_logits = logits[target_pos_idx : target_pos_idx + 1, :]
+            target_logits = logits[target_pos_idx, :].unsqueeze(0)
         else:
             target_logits = logits
     elif logits.ndim == 1:
@@ -408,8 +434,8 @@ def extract_sepsis_probability(
     return [float(p) for p in prob_list]
 
 
-def get_target_token_ids(tokenizer: Any) -> Tuple[int, int]:
-    """Retrieves token IDs for positive ('Sepsis') and negative ('Non-Sepsis') completions."""
+def get_target_token_ids(tokenizer: Any) -> Tuple[List[int], List[int]]:
+    """Return all token IDs for both binary completions."""
     pos_text = config.STEP4_TARGET_COMPLETION_POSITIVE
     neg_text = config.STEP4_TARGET_COMPLETION_NEGATIVE
 
@@ -421,21 +447,53 @@ def get_target_token_ids(tokenizer: Any) -> Tuple[int, int]:
     if not neg_ids:
         raise ValueError(f"Tokenizer produced empty token IDs for '{neg_text}'")
 
-    return pos_ids[0], neg_ids[0]
+    if pos_ids == neg_ids:
+        raise ValueError("Binary completions must tokenize to distinct sequences")
+    return pos_ids, neg_ids
+
+
+@torch.inference_mode()
+def predict_sepsis(model, processor, record, max_seq_length=config.STEP4_MAX_SEQ_LENGTH):
+    """Score both complete labels on the same observation prompt and generate a separate rationale."""
+    model.eval()
+    device = model.get_input_embeddings().weight.device
+    targets = get_target_token_ids(processor.tokenizer)
+    fitted_prompt, prompt_inputs = prepare_model_prompt(
+        record, processor, max_seq_length - max(map(len, targets)),
+    )
+    prompt_length = prompt_inputs["input_ids"].shape[-1]
+    scores = []
+    for target in targets:
+        inputs = append_completion(prompt_inputs, target)
+        labels = inputs.pop("labels").to(device)
+        logits = model(**{key: value.to(device) for key, value in inputs.items()}).logits
+        # The position immediately before each completion token predicts that token.
+        log_probs = logits[:, prompt_length - 1 : -1].float().log_softmax(dim=-1)
+        scores.append(log_probs.gather(-1, labels[:, prompt_length:, None]).sum().item())
+    probability = compute_sepsis_probability(*scores)
+
+    if not fitted_prompt.endswith(config.STEP4_TARGET_TASK):
+        raise ValueError("Expected the binary task instruction at the end of the prompt")
+    rationale_prompt = fitted_prompt.removesuffix(config.STEP4_TARGET_TASK) + config.STEP5_RATIONALE_TASK
+    _, rationale_inputs = prepare_model_prompt(
+        {**record, "prompt_text": rationale_prompt}, processor,
+        max_seq_length - config.STEP5_RATIONALE_MAX_NEW_TOKENS,
+    )
+    generated = model.generate(
+        **{key: value.to(device) for key, value in rationale_inputs.items()},
+        max_new_tokens=config.STEP5_RATIONALE_MAX_NEW_TOKENS, do_sample=False,
+    )
+    rationale = processor.tokenizer.decode(
+        generated[0, rationale_inputs["input_ids"].shape[-1]:], skip_special_tokens=True,
+    )
+    return format_inference_output(probability, rationale)
 
 
 def format_inference_output(
     sepsis_probability: float,
     reasoning_chain: str,
 ) -> Dict[str, Any]:
-    """Builds a validated dictionary according to the Step 5 inference contract.
-
-    Schema:
-    {
-        "sepsis_probability": <float between 0.0 and 1.0>,
-        "reasoning_chain": "<short evidence-based clinical rationale>"
-    }
-    """
+    """Validate and package the probability and clinical rationale."""
     prob = float(sepsis_probability)
     if not (0.0 <= prob <= 1.0):
         raise ValueError(f"sepsis_probability must be in [0.0, 1.0], got {prob}")

@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from datasets import DatasetDict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
@@ -70,22 +69,38 @@ def test_tokenize_and_mask_labels_target_only_supervision():
         assert labels[idx] != -100
 
 
-def test_tokenize_and_mask_labels_truncation_preserves_target():
-    """Verify that truncation keeps the target completion tokens intact."""
+def test_overlong_observations_fail_instead_of_dropping_windows():
     tokenizer = MockTokenizer()
     prompt = "word " * 100
     completion = "Non-Sepsis"
 
     max_len = 10
-    tokenized = tokenize_and_mask_labels(prompt, completion, tokenizer=tokenizer, max_seq_length=max_len)
+    with pytest.raises(ValueError, match="Four windows do not fit"):
+        tokenize_and_mask_labels(prompt, completion, tokenizer=tokenizer, max_seq_length=max_len)
 
-    assert len(tokenized["input_ids"]) == max_len
-    assert len(tokenized["labels"]) == max_len
 
-    # The final token must be active (the target completion token)
-    assert tokenized["labels"][-1] != -100
-    # Earlier tokens should be masked
-    assert tokenized["labels"][0] == -100
+def test_budget_removes_graph_edges_and_keeps_each_observation():
+    tokenizer = MockTokenizer()
+    observations = [f"Window_{index} Vitals_{index} Labs_{index}" for index in range(4)]
+    prompt = "\n\n".join(
+        f"{line}\n- Retrieved KG Prior:\n" + "\n".join(
+            f"  [Concept_{i}] -> relation -> [Other_{i}]" for i in range(32)
+        )
+        for line in observations
+    )
+    bare_length = sum(len(line.split()) for line in observations)
+    empty_graph_length = len(f"- Retrieved KG Prior: {config.STEP4_BASELINE_KG_TEXT}".split())
+    result = tokenize_and_mask_labels(
+        prompt, "Sepsis", tokenizer, max_seq_length=bare_length + 4 * empty_graph_length + 1,
+    )
+    assert len(result["input_ids"]) == bare_length + 4 * empty_graph_length + 1
+    assert not set(tokenizer.encode("[Concept_0]")) & set(result["input_ids"])
+    positions = [result["input_ids"].index(tokenizer.encode(f"Window_{i}")[0]) for i in range(4)]
+    assert positions == sorted(positions)
+    for line in observations:
+        assert set(tokenizer.encode(line)).issubset(result["input_ids"])
+    assert result["labels"][:-1] == [-100] * (len(result["labels"]) - 1)
+    assert result["labels"][-1:] == tokenizer.encode("Sepsis")
 
 
 def test_build_stay_example_contract():
@@ -116,6 +131,8 @@ def test_build_stay_example_contract():
 
 def test_build_huggingface_dataset_splits_and_isolation():
     """Verify DatasetDict assembly and strict subject split isolation enforcement."""
+    from datasets import DatasetDict
+
     tokenizer = MockTokenizer()
     windows = make_synthetic_windows()
 
