@@ -56,53 +56,6 @@ def compute_sepsis_probability(
     return max(0.0, min(1.0, prob))
 
 
-def format_inference_output(
-    probability: float,
-    reasoning_chain: str,
-) -> Dict[str, Any]:
-    """Format the two-field inference output dictionary."""
-    if not (0.0 <= probability <= 1.0):
-        raise ValueError(f"Sepsis probability must be in [0.0, 1.0], got {probability}")
-    if not isinstance(reasoning_chain, str):
-        raise TypeError(f"reasoning_chain must be a string, got {type(reasoning_chain).__name__}")
-
-    return {
-        "sepsis_probability": round(float(probability), 4),
-        "reasoning_chain": reasoning_chain.strip(),
-    }
-
-
-def validate_inference_output(output_payload: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Validate that an inference output payload strictly conforms to the two-field schema."""
-    if isinstance(output_payload, str):
-        try:
-            data = json.loads(output_payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Inference output is not valid JSON: {exc}") from exc
-    elif isinstance(output_payload, dict):
-        data = output_payload
-    else:
-        raise TypeError(f"Expected str or dict, got {type(output_payload).__name__}")
-
-    required_keys = {"sepsis_probability", "reasoning_chain"}
-    if not required_keys.issubset(data.keys()):
-        missing = required_keys - set(data.keys())
-        raise ValueError(f"Inference output missing required fields: {missing}")
-
-    prob = data["sepsis_probability"]
-    if not isinstance(prob, (int, float)) or math.isnan(prob) or not (0.0 <= prob <= 1.0):
-        raise ValueError(f"sepsis_probability must be a float between 0.0 and 1.0, got: {prob}")
-
-    rationale = data["reasoning_chain"]
-    if not isinstance(rationale, str) or not rationale.strip():
-        raise ValueError("reasoning_chain must be a non-empty string")
-
-    return {
-        "sepsis_probability": float(prob),
-        "reasoning_chain": rationale.strip(),
-    }
-
-
 def format_window_header(window_idx: int) -> str:
     """Format the chronological window interval header."""
     if type(window_idx) is not int or window_idx not in range(config.NUM_WINDOWS):
@@ -188,14 +141,17 @@ def serialize_window_block(
     subgraph: Optional[nx.MultiDiGraph] = None,
     image_line: Optional[str] = None,
     max_edges: int = config.STEP3_MAX_EDGES_PER_WINDOW,
+    include_graph: bool = True,
 ) -> str:
     """Serialize a single 6-hour window into its chronological text block."""
     header = format_window_header(window_idx)
     vitals = format_vitals_line(window_data)
     labs = format_labs_line(window_data)
     img = image_line if image_line is not None else f"- Image: {config.STEP4_NO_IMAGE_PLACEHOLDER}"
-    kg_text = serialize_subgraph_edges(subgraph, max_edges=max_edges)
-    return f"{header}\n{vitals}\n{labs}\n{img}\n{kg_text}"
+    block = f"{header}\n{vitals}\n{labs}\n{img}"
+    if include_graph:
+        block += "\n" + serialize_subgraph_edges(subgraph, max_edges=max_edges)
+    return block
 
 
 def resolve_image_path(
@@ -223,6 +179,7 @@ def assemble_multimodal_prompt(
     subgraphs: Optional[Dict[str, nx.MultiDiGraph]] = None,
     cxr_dir: Optional[Union[str, Path]] = None,
     max_edges_per_window: int = config.STEP3_MAX_EDGES_PER_WINDOW,
+    include_graph: bool = True,
 ) -> Tuple[str, List[str]]:
     """Build the 24-hour prompt and return image paths in placeholder order."""
     if len(stay_windows) != config.NUM_WINDOWS:
@@ -261,6 +218,7 @@ def assemble_multimodal_prompt(
             subgraph=sg,
             image_line=image_line,
             max_edges=max_edges_per_window,
+            include_graph=include_graph,
         )
         window_blocks.append(block)
 

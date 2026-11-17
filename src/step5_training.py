@@ -1,8 +1,6 @@
 """Prepare QLoRA training batches and produce sepsis scores with evidence summaries."""
 
-import json
 from pathlib import Path
-import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
@@ -522,29 +520,3 @@ def validate_inference_output(output_dict: Any) -> bool:
     if not isinstance(chain, str) or not chain.strip():
         return False
     return True
-
-
-def parse_inference_json(raw_text: str) -> Dict[str, Any]:
-    """Parses and validates a raw model completion string into structured inference output.
-
-    Handles optional markdown JSON code blocks (e.g. ```json ... ```) or embedded JSON objects.
-    """
-    cleaned = raw_text.strip()
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(1).strip()
-    else:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            cleaned = cleaned[start : end + 1]
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Failed to decode valid JSON from text: {raw_text}") from exc
-
-    if not validate_inference_output(data):
-        raise ValueError(f"Parsed JSON does not conform to inference schema: {data}")
-    return data
-

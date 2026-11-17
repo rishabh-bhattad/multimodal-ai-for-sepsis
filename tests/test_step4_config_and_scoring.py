@@ -1,6 +1,5 @@
 """Unit tests for Step 4 configuration parameters, target completions, and scoring logic."""
 
-import json
 import math
 import sys
 from pathlib import Path
@@ -11,9 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 from src.step4_serialization import (
     compute_sepsis_probability,
-    format_inference_output,
     get_target_completion,
-    validate_inference_output,
 )
 
 
@@ -91,45 +88,3 @@ def test_compute_sepsis_probability_inf_and_nan():
     assert compute_sepsis_probability(1.0, float("inf")) == 0.0
     assert compute_sepsis_probability(float("-inf"), 0.0) == 0.0
     assert compute_sepsis_probability(0.0, float("-inf")) == 1.0
-
-
-def test_format_and_validate_inference_output():
-    """Verify two-field inference formatting and schema validation."""
-    formatted = format_inference_output(0.85239, "Tachycardia and high lactate present.")
-    assert formatted["sepsis_probability"] == 0.8524
-    assert formatted["reasoning_chain"] == "Tachycardia and high lactate present."
-
-    # Validate dict input
-    validated = validate_inference_output(formatted)
-    assert validated["sepsis_probability"] == 0.8524
-    assert validated["reasoning_chain"] == "Tachycardia and high lactate present."
-
-    # Validate JSON string input
-    json_str = json.dumps(formatted)
-    validated_json = validate_inference_output(json_str)
-    assert validated_json == validated
-
-
-def test_format_inference_output_invalid_inputs():
-    """Verify formatting rejects out-of-range probabilities or invalid rationale types."""
-    with pytest.raises(ValueError):
-        format_inference_output(-0.01, "Rationale")
-    with pytest.raises(ValueError):
-        format_inference_output(1.01, "Rationale")
-    with pytest.raises(TypeError):
-        format_inference_output(0.5, 123)
-
-
-def test_validate_inference_output_rejects_malformed():
-    """Verify validation catches missing keys, non-JSON strings, or empty rationale."""
-    with pytest.raises(ValueError):
-        validate_inference_output('{"broken": json}')
-    with pytest.raises(ValueError):
-        validate_inference_output({"sepsis_probability": 0.5})  # missing reasoning_chain
-    with pytest.raises(ValueError):
-        validate_inference_output({"reasoning_chain": "Note"})  # missing sepsis_probability
-    with pytest.raises(ValueError):
-        validate_inference_output({"sepsis_probability": 1.5, "reasoning_chain": "Valid text"})
-    with pytest.raises(ValueError):
-        validate_inference_output({"sepsis_probability": 0.5, "reasoning_chain": "   "})  # empty rationale
-

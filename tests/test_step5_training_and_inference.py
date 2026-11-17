@@ -16,7 +16,6 @@ from src.step5_training import (
     format_inference_output,
     get_target_token_ids,
     get_training_arguments,
-    parse_inference_json,
     save_adapter_checkpoint,
     validate_inference_output,
     verify_adapter_reload,
@@ -229,27 +228,6 @@ def test_validate_inference_output():
 
     # Non-string reasoning
     assert validate_inference_output({"sepsis_probability": 0.5, "reasoning_chain": 123}) is False
-
-
-def test_parse_inference_json():
-    # Plain JSON
-    raw_plain = '{"sepsis_probability": 0.65, "reasoning_chain": "Lactate rising over 24h."}'
-    parsed = parse_inference_json(raw_plain)
-    assert parsed["sepsis_probability"] == 0.65
-    assert parsed["reasoning_chain"] == "Lactate rising over 24h."
-
-    # Markdown fenced JSON
-    raw_fenced = (
-        "Here is the evaluation:\n```json\n"
-        '{"sepsis_probability": 0.12, "reasoning_chain": "Stable vitals and normal lab values."}\n'
-        "```\nHope this helps."
-    )
-    parsed_fenced = parse_inference_json(raw_fenced)
-    assert parsed_fenced["sepsis_probability"] == 0.12
-
-    # Malformed text
-    with pytest.raises(ValueError, match="Failed to decode valid JSON"):
-        parse_inference_json("This is definitely not JSON.")
 
 
 class DummyDataset(torch.utils.data.Dataset):
