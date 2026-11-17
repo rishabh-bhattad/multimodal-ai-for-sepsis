@@ -279,3 +279,99 @@ def test_sepsis_trainer_smoke(tmp_path):
     # Save model via trainer
     trainer.save_model(str(output_dir / "final_adapter"))
     assert (output_dir / "final_adapter" / "adapter_config.json").exists()
+
+
+def _tiny_qwen_lora():
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+    from src.step5_training import get_qlora_config
+    cfg = Qwen3VLConfig(
+        text_config=dict(vocab_size=64, hidden_size=32, intermediate_size=64,
+            num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+            head_dim=8, rope_parameters={"rope_type":"default","mrope_section":[1,1,2]}),
+        vision_config=dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=4,
+            patch_size=2, spatial_merge_size=1, temporal_patch_size=1, out_hidden_size=32,
+            num_position_embeddings=16, deepstack_visual_indexes=[]),
+        image_token_id=60, video_token_id=61, vision_start_token_id=62, vision_end_token_id=63)
+    model = Qwen3VLForConditionalGeneration(cfg)
+    return apply_qlora_to_model(model, get_qlora_config(
+        r=2, lora_alpha=4, lora_dropout=0., target_modules=["q_proj","v_proj"]),
+        prepare_for_kbit=False)
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+@pytest.mark.parametrize("normalizer", [None, 9])
+def test_qwen_selected_logits_match_full_loss_and_adapter_gradients(with_image, normalizer):
+    from copy import deepcopy
+    from src.step5_training import supervised_position_loss
+    torch.manual_seed(9)
+    full = _tiny_qwen_lora()
+    selected = deepcopy(full)
+    ids = torch.tensor([[1,62,60,63,3,4,5,6], [1,2,3,4,5,6,0,0]])
+    if not with_image:
+        ids[0,1:4] = torch.tensor([7,8,9])
+    labels = torch.full_like(ids,-100)
+    labels[0,6:] = ids[0,6:]  # Two-token completion.
+    labels[1,5] = ids[1,5]   # Different completion length and right padding.
+    batch = dict(input_ids=ids, attention_mask=ids.ne(0).long(), labels=labels)
+    if with_image:
+        mm_types = torch.zeros_like(ids)
+        mm_types[0,2] = 1
+        batch.update(pixel_values=torch.randn(1,12), image_grid_thw=torch.tensor([[1,1,1]]),
+                     mm_token_type_ids=mm_types)
+    kwargs = {} if normalizer is None else {"num_items_in_batch":normalizer}
+    reference = full(**batch, use_cache=False, **kwargs).loss
+    observed, output = supervised_position_loss(selected,batch,normalizer)
+    torch.testing.assert_close(observed,reference,rtol=1e-5,atol=1e-6)
+    assert output.logits.shape == (2,3,64)  # Union of positions predicting supervised tokens.
+    reference.backward()
+    observed.backward()
+    grad_count = 0
+    for (name,a),(other,b) in zip(full.named_parameters(), selected.named_parameters()):
+        assert name == other
+        if a.grad is not None:
+            assert b.grad is not None
+            torch.testing.assert_close(b.grad,a.grad,rtol=2e-4,atol=1e-6)
+            grad_count += 1
+    assert grad_count > 0
+
+
+def test_selected_loss_gradient_accumulation_matches_full():
+    from copy import deepcopy
+    from src.step5_training import supervised_position_loss
+    torch.manual_seed(12)
+    full = _tiny_qwen_lora()
+    selected = deepcopy(full)
+    batches = []
+    for target_length in [1,3]:
+        ids = torch.tensor([[1,2,3,4,5,6]])
+        labels = torch.full_like(ids,-100)
+        labels[:,-target_length:] = ids[:,-target_length:]
+        batches.append(dict(input_ids=ids, attention_mask=torch.ones_like(ids), labels=labels))
+    for batch in batches:
+        full(**batch,use_cache=False,num_items_in_batch=4).loss.backward()
+        supervised_position_loss(selected,batch,4)[0].backward()
+    for a,b in zip(full.parameters(),selected.parameters()):
+        if a.grad is not None:
+            torch.testing.assert_close(a.grad,b.grad,rtol=2e-4,atol=1e-6)
+
+
+def test_selected_trainer_train_eval_train_on_cpu(tmp_path):
+    model = _tiny_qwen_lora()
+    shapes = []
+    hook = model.get_base_model().lm_head.register_forward_pre_hook(
+        lambda module,args: shapes.append(args[0].shape[1]))
+    data = [
+        {"input_ids":[1,2,3,4,5,6],"attention_mask":[1]*6,"labels":[-100]*5+[6]},
+        {"input_ids":[1,2,3,4,5,6],"attention_mask":[1]*6,"labels":[-100]*4+[5,6]},
+    ]
+    args = get_training_arguments(output_dir=tmp_path, use_cpu=True, bf16=False, fp16=False,
+        max_steps=2, per_device_train_batch_size=1, per_device_eval_batch_size=1,
+        gradient_accumulation_steps=2, eval_strategy="steps", eval_steps=1,
+        save_strategy="no", report_to="none", logging_steps=1)
+    trainer = SepsisTrainer(model=model,args=args,train_dataset=data,eval_dataset=data,
+                            data_collator=MultimodalDataCollator())
+    assert trainer.supervised_logits_only
+    assert trainer.train().global_step == 2
+    hook.remove()
+    assert shapes and max(shapes) <= 2
+    assert len([x for x in trainer.state.log_history if "eval_loss" in x]) == 2

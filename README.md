@@ -235,4 +235,10 @@ rejected. Add `--rationales` to save generated test rationales locally.
 python -m pytest tests/ -q
 ```
 
-Compact KG serialization preserves the existing displayed edge evidence. Full-cohort checks reduced 8K overflows to 200 temporal-RAG prompts and zero static-RAG/no-KG prompts. See [compact-context measurements](docs/experiments/compact-context-check.md) for the method, image settings, and remaining limits.
+## Implementation and experiment notes
+
+Detailed implementation checks and experiment measurements are kept outside
+this overview:
+
+- [Compact KG representation and context measurements](docs/experiments/compact-context-check.md)
+- [Supervised-position loss implementation check](docs/experiments/supervised-position-loss-check.md)

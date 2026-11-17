@@ -221,6 +221,7 @@ def run(args):
         "mode": "full" if args.full else "smoke", "max_steps": max_steps,
         "train_stays": len(data["train"]), "validation_stays": len(data["validation"]),
         "epochs": args.epochs, "seed": config.RANDOM_SEED,
+        "loss_projection": "supervised_positions_only",
         "quantization": "NF4-double", "dtype": str(dtype),
         "lora_r": config.STEP5_LORA_R, "lora_alpha": config.STEP5_LORA_ALPHA,
         "lora_dropout": config.STEP5_LORA_DROPOUT,

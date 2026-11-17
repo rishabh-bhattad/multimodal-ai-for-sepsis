@@ -322,6 +322,39 @@ def get_training_arguments(
     return TrainingArguments(**args_dict)
 
 
+def supervised_position_loss(model, inputs, num_items_in_batch=None):
+    """Exact causal CE using only vocabulary logits that have supervised targets.
+
+    Every prompt/image token still enters the transformer. The selected index
+    j predicts labels[j+1]; union indices support differently padded batches.
+    """
+    labels = inputs["labels"]
+    if labels.ndim != 2:
+        raise ValueError("Expected batch-by-sequence causal labels")
+    targets = labels[:, 1:]
+    positions = (targets != -100).any(dim=0).nonzero(as_tuple=True)[0]
+    if not positions.numel():
+        raise ValueError("Batch has no supervised causal target tokens")
+    forward = {key: value for key, value in inputs.items()
+               if key not in ("labels", "num_items_in_batch", "logits_to_keep", "shift_labels", "use_cache", "return_dict")}
+    if "shift_labels" in inputs:
+        raise ValueError("Pre-shifted labels require a separately verified loss path")
+    outputs = model(**forward, logits_to_keep=positions, use_cache=False, return_dict=True)
+    logits = outputs.logits
+    selected_targets = targets.index_select(1, positions.to(targets.device)).to(logits.device)
+    loss = torch.nn.functional.cross_entropy(
+        logits.float().reshape(-1, logits.shape[-1]), selected_targets.reshape(-1),
+        ignore_index=-100, reduction="sum" if num_items_in_batch is not None else "mean",
+    )
+    if num_items_in_batch is not None:
+        denominator = torch.as_tensor(num_items_in_batch, device=loss.device)
+        if denominator.item() <= 0:
+            raise ValueError("Supervised token denominator must be positive")
+        loss = loss / denominator
+    outputs["loss"] = loss
+    return loss, outputs
+
+
 class SepsisTrainer(Trainer):
     """Custom Trainer subclass for multimodal sepsis fine-tuning with adapter saving."""
 
@@ -351,6 +384,25 @@ class SepsisTrainer(Trainer):
             processing_class=processor if processor is not None else tokenizer,
             **kwargs,
         )
+
+        base = model.get_base_model() if hasattr(model, "get_base_model") else model
+        self.supervised_logits_only = getattr(getattr(base, "config", None), "model_type", None) == "qwen3_vl"
+        if self.supervised_logits_only:
+            self.model_accepts_loss_kwargs = True
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if not self.supervised_logits_only:
+            return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+        if self.label_smoother is not None or self.compute_loss_func is not None:
+            raise ValueError("Selected-logit loss supports the existing unsmoothed causal CE only")
+        loss, outputs = supervised_position_loss(model, inputs, num_items_in_batch)
+        # Modern Trainer must not divide a token-sum-normalized loss again.
+        self.loss_is_scaled_for_ga = num_items_in_batch is not None
+        if (self.args.average_tokens_across_devices and num_items_in_batch is not None):
+            scale = self.accelerator.num_processes // self.get_tp_size()
+            loss = loss * (scale if self.args.n_gpu <= 1 else self.args.n_gpu)
+            outputs.loss = loss
+        return (loss, outputs) if return_outputs else loss
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """Overrides save_model to ensure PEFT adapters are saved properly."""
