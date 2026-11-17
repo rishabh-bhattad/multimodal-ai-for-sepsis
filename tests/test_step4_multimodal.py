@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import networkx as nx
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -12,7 +13,81 @@ import config
 from src.step4_serialization import (
     assemble_multimodal_prompt,
     resolve_image_path,
+    select_stays_for_dataset,
+    validate_stay_alignment,
 )
+
+
+def test_sample_selects_unique_subjects_and_images_from_later_windows():
+    rows = [
+        {"stay_id": stay, "subject_id": subject, "window_idx": index,
+         "cxr_path": "later.jpg" if stay == 11 and index == 3 else ""}
+        for stay, subject in ((10, 1), (11, 1), (12, 2)) for index in range(4)
+    ]
+    windows = pd.DataFrame(rows)
+    trajectories = {str(stay): {} for stay in (10, 11, 12)}
+    assert select_stays_for_dataset(trajectories, windows, 2) == [11, 12]
+    assert select_stays_for_dataset(trajectories, windows, None) == [10, 11, 12]
+    with pytest.raises(ValueError, match="only 2 are eligible"):
+        select_stays_for_dataset(trajectories, windows, 3)
+    del trajectories["10"]
+    with pytest.raises(ValueError, match="identical stay sets"):
+        select_stays_for_dataset(trajectories, windows, None)
+    assert select_stays_for_dataset(trajectories, windows, 2) == [11, 12]
+
+
+@pytest.fixture
+def aligned_stay():
+    rows, graphs = [], {}
+    for index in range(4):
+        start = pd.Timestamp("2020-01-01") + pd.Timedelta(hours=6 * index)
+        end = start + pd.Timedelta(hours=6)
+        rows.append({"subject_id": 1, "split": "train", "label": 0,
+                     "window_idx": index, "window_start": start, "window_end": end})
+        graphs[f"window_{index}"] = nx.MultiDiGraph(
+            window_idx=index, start=start.isoformat(), end=end.isoformat()
+        )
+    return pd.DataFrame(rows), {"subject_id": 1, "split": "train", "windows": graphs}
+
+
+def test_alignment_accepts_explicit_empty_graphs(aligned_stay):
+    validate_stay_alignment(*aligned_stay)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("subject_id", 2), ("split", "test"), ("label", 1), ("window_idx", 2),
+    ("window_start", pd.Timestamp("2020-01-02")),
+])
+def test_alignment_rejects_inconsistent_windows(aligned_stay, field, value):
+    rows, trajectory = aligned_stay
+    rows.loc[0, field] = value
+    with pytest.raises(ValueError):
+        validate_stay_alignment(rows, trajectory)
+
+
+@pytest.mark.parametrize("field,value", [("subject_id", 2), ("split", "test")])
+def test_alignment_rejects_wrong_patient_or_split(aligned_stay, field, value):
+    rows, trajectory = aligned_stay
+    trajectory[field] = value
+    with pytest.raises(ValueError, match="Trajectory subject or split"):
+        validate_stay_alignment(rows, trajectory)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("window_idx", 1), ("start", "2020-01-02"), ("end", None),
+])
+def test_alignment_rejects_wrong_graph_window(aligned_stay, field, value):
+    rows, trajectory = aligned_stay
+    trajectory["windows"]["window_0"].graph[field] = value
+    with pytest.raises(ValueError):
+        validate_stay_alignment(rows, trajectory)
+
+
+def test_alignment_rejects_missing_graph(aligned_stay):
+    rows, trajectory = aligned_stay
+    del trajectory["windows"]["window_0"]
+    with pytest.raises(ValueError, match="all four window graphs"):
+        validate_stay_alignment(rows, trajectory)
 
 
 def make_synthetic_windows(cxr_paths=(None, None, None, None)):

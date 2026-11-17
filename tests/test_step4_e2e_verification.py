@@ -55,7 +55,9 @@ def cohort_pipeline_fixture(tmp_path):
 
         stay_subgraphs = {}
         for w in range(config.NUM_WINDOWS):
-            g = nx.MultiDiGraph()
+            start = pd.Timestamp("2020-01-01") + pd.Timedelta(hours=6 * w)
+            end = start + pd.Timedelta(hours=6)
+            g = nx.MultiDiGraph(window_idx=w, start=start.isoformat(), end=end.isoformat())
             if w == 1:
                 g.add_node("d1", node_name="Consolidation")
                 g.add_node("d2", node_name="Bacterial Pneumonia")
@@ -78,6 +80,8 @@ def cohort_pipeline_fixture(tmp_path):
                 "stay_id": stay_id,
                 "subject_id": subject_id,
                 "window_idx": w,
+                "window_start": start,
+                "window_end": end,
                 "split": split,
                 "label": label,
                 "heart_rate_mean": 75.0 + w * 10,

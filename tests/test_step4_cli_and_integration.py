@@ -19,7 +19,6 @@ from src import step4_serialization as step4
 @pytest.fixture
 def synthetic_step4_inputs(tmp_path):
     """Create small synthetic patient_windows.parquet and subgraph_trajectories.pkl."""
-    # 12 stays across 10 unique subjects
     rows = []
     trajectories = {}
     for i in range(1, 11):
@@ -31,7 +30,9 @@ def synthetic_step4_inputs(tmp_path):
         # Subgraphs for this stay
         stay_subgraphs = {}
         for w in range(4):
-            g = nx.MultiDiGraph()
+            start = pd.Timestamp("2020-01-01") + pd.Timedelta(hours=6 * w)
+            end = start + pd.Timedelta(hours=6)
+            g = nx.MultiDiGraph(window_idx=w, start=start.isoformat(), end=end.isoformat())
             if w == 0:
                 g.add_node("c1", node_name="Tachycardia")
                 g.add_node("c2", node_name="Sepsis")
@@ -42,6 +43,8 @@ def synthetic_step4_inputs(tmp_path):
                 "stay_id": stay_id,
                 "subject_id": subject_id,
                 "window_idx": w,
+                "window_start": start,
+                "window_end": end,
                 "split": split,
                 "label": label,
                 "heart_rate_mean": 85.0 + w,

@@ -10,9 +10,7 @@ import hashlib
 import json
 import logging
 import math
-import os
 import pickle
-import random
 import sys
 from collections import Counter
 from pathlib import Path
@@ -116,84 +114,46 @@ def format_window_header(window_idx: int) -> str:
 
 def _is_valid_measurement(val: Any) -> bool:
     """Check whether a measurement is present and finite enough to format."""
-    if val is None:
-        return False
     try:
-        fval = float(val)
-        return not (math.isnan(fval) or math.isinf(fval))
+        return math.isfinite(float(val))
     except (TypeError, ValueError):
         return False
 
 
+def _format_measurements(measurements):
+    """Apply the same missing-value and rounding rules to vitals and labs."""
+    return ", ".join(
+        f"{name} {round(float(value), precision)}{unit}"
+        for name, value, precision, unit in measurements
+        if _is_valid_measurement(value)
+    )
+
+
 def format_vitals_line(window: Dict[str, Any]) -> str:
-    """Format structured vitals for a 6-hour window into a concise text summary.
-
-    Parameters
-    ----------
-    window : dict
-        Window dictionary with vital sign measurements.
-
-    Returns
-    -------
-    str
-        Formatted vitals line, or explicit absence statement if none recorded.
-    """
-    parts: List[str] = []
-
-    hr = window.get("heart_rate_mean")
-    if _is_valid_measurement(hr):
-        parts.append(f"Heart Rate {round(float(hr))} bpm")
-
-    map_val = window.get("map_latest")
-    if _is_valid_measurement(map_val):
-        parts.append(f"MAP {round(float(map_val))} mmHg")
-
-    spo2 = window.get("spo2_mean")
-    if _is_valid_measurement(spo2):
-        parts.append(f"SpO2 {round(float(spo2))}%")
-
+    """Format observed vitals, preserving the existing temperature fallback."""
     temp = window.get("temp_latest")
     if not _is_valid_measurement(temp):
         temp = window.get("temp_mean")
-    if _is_valid_measurement(temp):
-        parts.append(f"Temp {round(float(temp), 1)} C")
-
-    rr = window.get("resp_rate_mean")
-    if _is_valid_measurement(rr):
-        parts.append(f"Resp Rate {round(float(rr))} bpm")
-
-    if parts:
-        return f"- Vitals: {', '.join(parts)}."
-    return "- Vitals: No vital signs recorded in this window."
+    text = _format_measurements([
+        ("Heart Rate", window.get("heart_rate_mean"), None, " bpm"),
+        ("MAP", window.get("map_latest"), None, " mmHg"),
+        ("SpO2", window.get("spo2_mean"), None, "%"),
+        ("Temp", temp, 1, " C"),
+        ("Resp Rate", window.get("resp_rate_mean"), None, " bpm"),
+    ])
+    return f"- Vitals: {text or 'No vital signs recorded in this window'}."
 
 
 def format_labs_line(window: Dict[str, Any]) -> str:
     """Format structured laboratory measurements for a 6-hour window."""
-    parts: List[str] = []
-
-    lac = window.get("lactate_latest")
-    if _is_valid_measurement(lac):
-        parts.append(f"Lactate {round(float(lac), 1)} mmol/L")
-
-    plt = window.get("platelets_latest")
-    if _is_valid_measurement(plt):
-        parts.append(f"Platelets {round(float(plt))} k/uL")
-
-    cr = window.get("creatinine_latest")
-    if _is_valid_measurement(cr):
-        parts.append(f"Creatinine {round(float(cr), 1)} mg/dL")
-
-    wbc = window.get("wbc_latest")
-    if _is_valid_measurement(wbc):
-        parts.append(f"WBC {round(float(wbc), 1)} k/uL")
-
-    bili = window.get("bilirubin_latest")
-    if _is_valid_measurement(bili):
-        parts.append(f"Bilirubin {round(float(bili), 1)} mg/dL")
-
-    if parts:
-        return f"- Labs: {', '.join(parts)}."
-    return "- Labs: No laboratory measurements recorded in this window."
+    text = _format_measurements([
+        ("Lactate", window.get("lactate_latest"), 1, " mmol/L"),
+        ("Platelets", window.get("platelets_latest"), None, " k/uL"),
+        ("Creatinine", window.get("creatinine_latest"), 1, " mg/dL"),
+        ("WBC", window.get("wbc_latest"), 1, " k/uL"),
+        ("Bilirubin", window.get("bilirubin_latest"), 1, " mg/dL"),
+    ])
+    return f"- Labs: {text or 'No laboratory measurements recorded in this window'}."
 
 
 def serialize_subgraph_edges(
@@ -243,13 +203,8 @@ def resolve_image_path(
     cxr_dir: Optional[Union[str, Path]] = None,
 ) -> Optional[str]:
     """Resolve an image path to a normalized string path."""
-    if cxr_path is None:
+    if cxr_path is None or pd.isna(cxr_path):
         return None
-    try:
-        if isinstance(cxr_path, float) and math.isnan(cxr_path):
-            return None
-    except (TypeError, ValueError):
-        pass
 
     path_str = str(cxr_path).strip()
     if not path_str or path_str.lower() in ("nan", "none"):
@@ -440,17 +395,8 @@ def build_huggingface_dataset(
     """Build a Hugging Face DatasetDict partitioned by train, validation, and test splits."""
     from datasets import Dataset, DatasetDict
 
-    splits_data: Dict[str, List[Dict[str, Any]]] = {
-        "train": [],
-        "validation": [],
-        "test": [],
-    }
-
-    subjects_by_split: Dict[str, set] = {
-        "train": set(),
-        "validation": set(),
-        "test": set(),
-    }
+    splits_data = {name: [] for name in ("train", "validation", "test")}
+    subjects_by_split = {name: set() for name in splits_data}
 
     for ex in examples:
         raw_split = ex.get("split", "train")
@@ -470,7 +416,7 @@ def build_huggingface_dataset(
             )
 
     return DatasetDict({
-        name: Dataset.from_list(rows if rows else [])
+        name: Dataset.from_list(rows)
         for name, rows in splits_data.items()
     })
 
@@ -504,7 +450,7 @@ def load_patient_windows_parquet(path: Path) -> Tuple[pd.DataFrame, str]:
         raise FileNotFoundError(f"Patient windows parquet not found: {path}")
     digest = compute_file_sha256(p)
     df = pd.read_parquet(p)
-    required = {"stay_id", "subject_id", "window_idx", "split", "label"}
+    required = {"stay_id", "subject_id", "window_idx", "window_start", "window_end", "split", "label"}
     if not required.issubset(df.columns):
         missing = required - set(df.columns)
         raise ValueError(f"Patient windows parquet missing required columns: {missing}")
@@ -516,42 +462,67 @@ def select_stays_for_dataset(
     windows_df: pd.DataFrame,
     sample_size: Optional[int] = config.STEP4_SAMPLE_SIZE,
 ) -> List[int]:
-    """Select eligible stay IDs deterministically, preserving patient splits and image coverage.
-
-    If sample_size is None, returns all eligible stay IDs.
-    """
+    """Require matching full inputs, or sample distinct patients with image/no-image coverage."""
     traj_stay_ids = {int(k) for k in trajectories.keys()}
+    if len(traj_stay_ids) != len(trajectories):
+        raise ValueError("Duplicate trajectory stay keys")
     win_stay_ids = set(windows_df["stay_id"].unique())
+    if sample_size is None and traj_stay_ids != win_stay_ids:
+        raise ValueError("Full processing requires identical stay sets in both inputs")
     common_stay_ids = sorted(traj_stay_ids.intersection(win_stay_ids))
 
     if not common_stay_ids:
         raise ValueError("No common stay IDs between trajectories and patient windows")
 
-    if sample_size is None or len(common_stay_ids) <= sample_size:
+    if sample_size is None:
         return common_stay_ids
+    if sample_size < 1:
+        raise ValueError("sample_size must be positive")
 
-    sub_df = windows_df[windows_df["stay_id"].isin(common_stay_ids)].drop_duplicates("stay_id")
-    sub_df = sub_df.assign(has_image=sub_df["cxr_path"].notna() if "cxr_path" in sub_df.columns else False)
+    windows = windows_df[windows_df["stay_id"].isin(common_stay_ids)]
+    has_image = windows["cxr_path"].map(resolve_image_path).notna() if "cxr_path" in windows else False
+    stays = windows.assign(has_image=has_image).groupby(
+        ["subject_id", "stay_id"], as_index=False
+    ).has_image.any().sort_values(["has_image", "stay_id"], ascending=[False, True])
+    patients = stays.drop_duplicates("subject_id").sort_values("subject_id").sample(
+        frac=1, random_state=config.RANDOM_SEED
+    )
+    if len(patients) < sample_size:
+        raise ValueError(f"Requested {sample_size} subjects, but only {len(patients)} are eligible")
+    coverage = patients.groupby("has_image", sort=False).head(1).head(sample_size)
+    selected = pd.concat([coverage, patients.drop(coverage.index)]).head(sample_size)
+    return sorted(selected.stay_id.tolist())
 
-    representatives: Dict[int, int] = {}
-    for row in sub_df.sort_values(["has_image", "stay_id"], ascending=[False, True]).to_dict("records"):
-        representatives.setdefault(row["subject_id"], row["stay_id"])
 
-    candidates = sorted(representatives.items())
-    rng = random.Random(config.RANDOM_SEED)
-    rng.shuffle(candidates)
+def validate_stay_alignment(stay_windows, trajectory):
+    """Reject mismatched observations and graphs before rendering any patient prompt."""
+    rows = stay_windows.sort_values("window_idx")
+    if rows.window_idx.tolist() != list(range(config.NUM_WINDOWS)):
+        raise ValueError("Each stay must contain exactly four distinct ordered windows")
+    metadata = rows[["subject_id", "split", "label"]]
+    if metadata.isna().any().any() or not metadata.nunique().eq(1).all():
+        raise ValueError("Window subject, split, and label metadata must agree within each stay")
+    if not isinstance(trajectory, dict) or any(
+        trajectory.get(key) != rows.iloc[0][key] for key in ("subject_id", "split")
+    ):
+        raise ValueError("Trajectory subject or split does not match the observation windows")
+    graphs = trajectory.get("windows")
+    if not isinstance(graphs, dict) or set(graphs) != {f"window_{i}" for i in range(config.NUM_WINDOWS)}:
+        raise ValueError("Trajectory must contain all four window graphs, including empty graphs")
 
-    coverage_cases: Dict[bool, Tuple[int, int]] = {}
-    stay_to_img = dict(zip(sub_df["stay_id"], sub_df["has_image"]))
-    for sub, sid in candidates:
-        coverage_cases.setdefault(stay_to_img.get(sid, False), (sub, sid))
-
-    selected = [coverage_cases[k] for k in (True, False) if k in coverage_cases][:sample_size]
-    selected_subs = {s for s, _ in selected}
-    selected.extend((s, sid) for s, sid in candidates if s not in selected_subs)
-
-    final_stays = [sid for _, sid in sorted(selected[:sample_size], key=lambda x: x[1])]
-    return final_stays
+    previous_end = None
+    for row in rows.to_dict("records"):
+        start, end = pd.Timestamp(row["window_start"]), pd.Timestamp(row["window_end"])
+        if end - start != pd.Timedelta(hours=config.WINDOW_SIZE_HOURS) or (
+            previous_end is not None and start != previous_end
+        ):
+            raise ValueError("Observation windows must be contiguous six-hour intervals")
+        graph = graphs[f"window_{row['window_idx']}"]
+        if not isinstance(graph, nx.MultiDiGraph) or graph.graph.get("window_idx") != row["window_idx"]:
+            raise ValueError("Graph type or window index does not match the observation window")
+        if pd.Timestamp(graph.graph.get("start")) != start or pd.Timestamp(graph.graph.get("end")) != end:
+            raise ValueError("Graph timestamps do not match the observation window")
+        previous_end = end
 
 
 def summarize_dataset(
@@ -660,30 +631,22 @@ def run_step4_pipeline(
 
     examples = []
     for sid in sorted(selected_stays):
-        stay_rows = stays_grouped.get_group(sid).sort_values("window_idx").to_dict("records")
-        if len(stay_rows) != config.NUM_WINDOWS:
-            raise ValueError(f"Stay {sid} does not retain exactly {config.NUM_WINDOWS} windows")
-
-        subject_id = stay_rows[0]["subject_id"]
-        split = stay_rows[0]["split"]
-        label = stay_rows[0]["label"]
-
-        traj_entry = trajectories.get(str(sid), trajectories.get(sid, {}))
-        subgraphs = traj_entry.get("windows") if isinstance(traj_entry, dict) else None
-
-        ex = build_stay_example(
+        rows = stays_grouped.get_group(sid)
+        trajectory = trajectories.get(str(sid), trajectories.get(sid))
+        validate_stay_alignment(rows, trajectory)
+        stay_rows = rows.sort_values("window_idx").to_dict("records")
+        examples.append(build_stay_example(
             stay_id=sid,
-            subject_id=subject_id,
-            split=split,
+            subject_id=stay_rows[0]["subject_id"],
+            split=stay_rows[0]["split"],
             stay_windows=stay_rows,
-            label=label,
-            subgraphs=subgraphs,
+            label=stay_rows[0]["label"],
+            subgraphs=trajectory["windows"],
             tokenizer=tokenizer,
             cxr_dir=cxr_dir,
             max_seq_length=max_seq_length,
             max_edges_per_window=max_edges_per_window,
-        )
-        examples.append(ex)
+        ))
 
     dataset_dict = build_huggingface_dataset(examples)
 
