@@ -163,7 +163,7 @@ def evaluate_model_comparison(
     prepared = {variant: _test_predictions(predictions[variant]) for variant in VARIANTS if variant in predictions}
     reference = next(iter(prepared.values()))
     for data in prepared.values():
-        if not data.index.equals(reference.index) or not data[["subject_id", "label"]].equals(reference[["subject_id", "label"]]):
+        if not data.index.equals(reference.index) or not data[["subject_id", "label"]].eq(reference[["subject_id", "label"]]).all().all():
             raise ValueError("Model comparisons require identical test stays, subjects, and labels")
     models = {}
     for variant, data in prepared.items():

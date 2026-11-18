@@ -132,7 +132,7 @@ def compare(args, prediction_files, reference):
             raise ValueError("Predictions do not cover the shared held-out cohort")
         truth = reference[reference.split == "test"].drop_duplicates("stay_id").set_index("stay_id")
         aligned = predictions[variant].set_index("stay_id")
-        if not aligned[["subject_id", "label"]].sort_index().equals(truth[["subject_id", "label"]].sort_index()):
+        if not aligned[["subject_id", "label"]].sort_index().eq(truth[["subject_id", "label"]].sort_index()).all().all():
             raise ValueError("Predictions differ from the current cohort")
     report = evaluate_model_comparison(predictions, n_resamples=args.resamples)
     save_evaluation_report(report, args.output / "comparison")

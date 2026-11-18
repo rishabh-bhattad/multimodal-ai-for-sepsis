@@ -280,3 +280,14 @@ def test_cli_rejects_duplicate_variant_arguments(predictions, tmp_path):
     predictions.to_parquet(source, index=False)
     with pytest.raises(SystemExit):
         evaluation.main(["--prediction", f"trag={source}", "--prediction", f"trag={source}"])
+
+
+def test_identical_cohort_values_allow_different_integer_widths(predictions):
+    from src.step5_evaluation import evaluate_model_comparison
+    frames={"trag":predictions.copy()}
+    first=predictions.copy()
+    first["label"]=first["label"].astype("int32")
+    first["subject_id"]=first["subject_id"].astype("int32")
+    frames["xgboost"]=first
+    report=evaluate_model_comparison(frames,n_resamples=10)
+    assert report["validation"] == "passed"
